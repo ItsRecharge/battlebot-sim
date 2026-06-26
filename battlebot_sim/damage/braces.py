@@ -71,6 +71,16 @@ def apply_brace_sharing(result: DamageResult, bot: BotModel) -> DamageResult:
             if len(brace_faces):
                 out.peak_stress_per_face[brace_faces] += TRANSFER * float(shed.max())
 
+        # The transferred load raises the brace's own stress; recompute its
+        # failure margin from the brace's yield so the absorbed load reaches the
+        # verdict/heatmap (mirrors compute_damage: no/non-finite yield -> 0).
+        if len(brace_faces):
+            y = brace.material.yield_pa if brace.material else np.inf
+            if np.isfinite(y) and y > 0:
+                out.failure_margin_per_face[brace_faces] = (
+                    out.peak_stress_per_face[brace_faces] / y
+                )
+
     # Recompute per-part summaries from the modified fields.
     out.part_max_margin = {
         p.index: float(out.failure_margin_per_face[p.face_ids].max())

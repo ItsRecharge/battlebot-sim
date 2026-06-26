@@ -114,6 +114,40 @@ def test_brace_relieves_stress_monotonically():
     assert thin < 200e6 / 276e6  # any brace relieves some stress
 
 
+def test_brace_absorbs_transferred_load():
+    """Load shed by adjacent parts must surface in the brace's own margin."""
+    library = load_default_library()
+    bot = _braced_bot(library, brace_thickness=0.02)
+    from battlebot_sim.damage.model import DamageResult
+
+    n_faces = len(bot.original.faces)
+    face_part = np.zeros(n_faces, dtype=np.int64)
+    for p in bot.parts:
+        face_part[p.face_ids] = p.index
+    brace_idx = len(bot.parts) - 1  # the bar, as set by _braced_bot
+
+    # Stress only the cubes; the brace starts completely unstressed.
+    peak = np.zeros(n_faces)
+    for p in bot.parts:
+        if not p.is_brace:
+            peak[p.face_ids] = 200e6
+    yield_pa = library.get("Aluminum 6061-T6").yield_pa
+    margin = peak / yield_pa
+    result = DamageResult(
+        energy_per_face=np.zeros(n_faces),
+        peak_stress_per_face=peak.copy(),
+        failure_margin_per_face=margin.copy(),
+        face_part=face_part,
+        part_max_margin={p.index: float(margin[p.face_ids].max()) for p in bot.parts},
+        part_total_energy={p.index: 0.0 for p in bot.parts},
+    )
+    assert result.part_max_margin[brace_idx] == 0.0  # unstressed before sharing
+
+    shared = apply_brace_sharing(result, bot)
+    # The brace now carries transferred load, so its reported margin rises.
+    assert shared.part_max_margin[brace_idx] > 0.0
+
+
 def test_no_braces_is_noop():
     library = load_default_library()
     arena = build_arena(NHRL_CLASSES["3lb"])
