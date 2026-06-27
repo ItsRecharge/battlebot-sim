@@ -232,6 +232,8 @@ class SetupPanel(QtWidgets.QGroupBox):
 
     load_requested = QtCore.Signal(str, float)   # path, scale_to_m
     run_requested = QtCore.Signal(str)            # weight class key
+    stop_requested = QtCore.Signal()              # cancel a running battery
+    speed_changed = QtCore.Signal(float)          # live playback speed multiplier
 
     # STL import units -> factor converting one source unit to metres. Listed in
     # the order shown in the dropdown (metric first, then imperial); millimetres
@@ -265,15 +267,36 @@ class SetupPanel(QtWidgets.QGroupBox):
             "sweep plus seeded random extras). Damage accumulates across every "
             "trial into one worst-case map. Higher = more thorough but slower.")
 
+        # Live playback speed: the battery runs at (scaled) real time so the bot
+        # is watchable flying around the cage. MuJoCo is much faster than real
+        # time, so this throttles — 1x = real time, up to 4x to skim through.
+        self.speed_spin = QtWidgets.QDoubleSpinBox()
+        self.speed_spin.setRange(0.25, 4.0)
+        self.speed_spin.setSingleStep(0.25)
+        self.speed_spin.setValue(1.0)
+        self.speed_spin.setSuffix(" ×")
+        self.speed_spin.setToolTip(
+            "Live playback speed of the fly-around (1× = real time). Adjustable "
+            "while the battery runs.")
+        self.speed_spin.valueChanged.connect(self.speed_changed.emit)
+
         self.run_btn = QtWidgets.QPushButton("Run stress battery")
         self.run_btn.setEnabled(False)
         self.run_btn.setToolTip("Load a model first.")
+        self.stop_btn = QtWidgets.QPushButton("Stop")
+        self.stop_btn.setToolTip("Cancel the running battery; partial results are kept.")
+        self.stop_btn.hide()
+        self.stop_btn.clicked.connect(self.stop_requested.emit)
+        run_row = QtWidgets.QHBoxLayout()
+        run_row.addWidget(self.run_btn, 1)
+        run_row.addWidget(self.stop_btn)
+
         self.cage_check = QtWidgets.QCheckBox("Show arena cage during setup")
         self.cage_check.setToolTip(
             "Off by default so parts are easy to see and click; the cage always "
             "appears when you run the battery.")
         self.progress = QtWidgets.QProgressBar()
-        self.progress.setRange(0, 0)            # busy indicator
+        self.progress.setRange(0, 1)            # determinate: filled per event
         self.progress.hide()
 
         form = QtWidgets.QFormLayout(self)
@@ -282,7 +305,8 @@ class SetupPanel(QtWidgets.QGroupBox):
         form.addRow(self.load_btn)
         form.addRow(self.sample_btn)
         form.addRow("Trials:", self.trials_spin)
-        form.addRow(self.run_btn)
+        form.addRow("Playback speed:", self.speed_spin)
+        form.addRow(run_row)
         form.addRow(self.cage_check)
         form.addRow(self.progress)
 
@@ -314,6 +338,22 @@ class SetupPanel(QtWidgets.QGroupBox):
 
     def current_trials(self) -> int:
         return int(self.trials_spin.value())
+
+    def current_speed(self) -> float:
+        return float(self.speed_spin.value())
+
+    def show_running(self, running: bool) -> None:
+        """Flip the panel between idle and running: while a battery runs, Run is
+        disabled and a Stop button + determinate progress bar appear; loading a
+        new model is blocked so the worker's bot can't change underneath it."""
+        self.run_btn.setEnabled(not running)
+        self.stop_btn.setVisible(running)
+        self.load_btn.setEnabled(not running)
+        self.sample_btn.setEnabled(not running)
+        self.trials_spin.setEnabled(not running)
+        self.class_combo.setEnabled(not running)
+        self.unit_combo.setEnabled(not running)
+        self.progress.setVisible(running)
 
 
 class ResultsPanel(QtWidgets.QGroupBox):

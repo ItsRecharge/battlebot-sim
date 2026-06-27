@@ -53,3 +53,28 @@ def test_part_at_cell_lookup(two_box_bot):
     assert viz.part_at_cell(fp, int(bot.parts[1].face_ids[0])) == 1
     assert viz.part_at_cell(fp, -1) is None
     assert viz.part_at_cell(fp, 10**9) is None
+
+
+def test_attach_field_smooth_subdivides_to_point_scalars(two_box_bot):
+    """A coarse bot mesh must be subdivided into a denser POINT-scalar field so
+    the heatmap reads as a smooth gradient — guards against the subdivision
+    silently failing back to the coarse per-vertex mesh."""
+    from battlebot_sim.damage.model import DamageResult
+
+    bot = _bot(two_box_bot)
+    n = len(bot.original.faces)
+    energy = np.zeros(n)
+    energy[0] = 5.0                                   # one hot face
+    result = DamageResult(
+        energy_per_face=energy,
+        peak_stress_per_face=np.zeros(n),
+        failure_margin_per_face=np.zeros(n),
+        face_part=viz.face_part_array(bot),
+        part_max_margin={}, part_total_energy={})
+
+    base = viz.bot_polydata(bot)
+    heat, cmap, clim, title, log_scale = viz.attach_field_smooth(base, bot, result, "energy")
+    assert heat.n_faces > base.n_faces                # coarse mesh got subdivided
+    assert "energy" in heat.point_data                # smooth point scalars, not cells
+    assert len(heat.point_data["energy"]) == heat.n_points
+    assert log_scale is True                          # energy stays log-scaled

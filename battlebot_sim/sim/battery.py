@@ -23,7 +23,9 @@ from battlebot_sim.arena.nhrl import Arena
 from battlebot_sim.materials.assign import WeightClass
 from battlebot_sim.mesh.segment import BotModel
 from battlebot_sim.sim.engine import SimEngine
-from battlebot_sim.sim.recorder import ContactEvent, FrameSample, SimTrace
+from battlebot_sim.sim.recorder import (
+    ContactEvent, FrameSample, SimTrace, StreamChunk,
+)
 
 
 @dataclass
@@ -227,8 +229,23 @@ def _contain(engine: SimEngine, lo, hi, bmin, bmax,
         engine.set_pose(pos, quat)   # mj_forward refreshes contacts for read
 
 
-def run_battery(engine: SimEngine, battery: StressBattery, fps: int = 30) -> SimTrace:
-    """Run every event, recording bot poses (for replay) and contacts (for damage)."""
+def iter_battery(engine: SimEngine, battery: StressBattery, fps: int = 60):
+    """Streaming twin of ``run_battery``: run every event and, at each captured
+    frame, ``yield`` a :class:`StreamChunk` carrying that frame plus the contacts
+    produced since the previous captured frame. ``return``\\s the complete
+    ``SimTrace`` (available as ``StopIteration.value``).
+
+    Draining this generator to exhaustion reproduces ``run_battery``'s trace
+    byte-for-byte: frames are appended only at capture points and contacts every
+    step, exactly as before. Contacts on non-capture steps batch into ``pending``
+    and ride out on the next captured chunk's ``new_contacts`` (plus a final
+    tail-flush chunk), so a consumer that ingests every chunk's contacts never
+    misses one — only *renders* may be coalesced.
+
+    Cancellation: closing the generator (``gen.close()`` /
+    ``gen.throw(GeneratorExit)``) finalizes and returns the partial trace built
+    so far, so a cancelled run still yields usable (partial) results.
+    """
     dt = engine.timestep
     bot = engine.bot
     trace = SimTrace(dt=dt, n_parts=len(bot.parts))
@@ -248,61 +265,100 @@ def run_battery(engine: SimEngine, battery: StressBattery, fps: int = 30) -> Sim
     hi = np.array([L / 2.0, W / 2.0, H])
     bmin, bmax = bot.original.bounds[0], bot.original.bounds[1]
 
+    n_events = len(battery.events)
+    pending: list[ContactEvent] = []   # contacts since the last yielded frame
     t_global = 0.0
-    for ev in battery.events:
-        engine.reset()
-        engine.clear_applied()
-        engine.set_pose(ev.init_pos, ev.init_quat)
-        engine.set_velocity(ev.init_linvel, ev.init_angvel)
-
-        n_steps = int(round(ev.duration / dt))
-        for s in range(n_steps):
-            t_local = s * dt
+    try:
+        for ev_index, ev in enumerate(battery.events):
+            engine.reset()
             engine.clear_applied()
+            engine.set_pose(ev.init_pos, ev.init_quat)
+            engine.set_velocity(ev.init_linvel, ev.init_angvel)
 
-            pos, quat = engine.get_pose()
-            R = _quat_matrix(quat)            # body -> world rotation
+            n_steps = int(round(ev.duration / dt))
+            for s in range(n_steps):
+                t_local = s * dt
+                engine.clear_applied()
 
-            # Scheduled opponent strike: physical impulse + synthetic contact.
-            if ev.strike and ev.strike.t_start <= t_local < ev.strike.t_end:
-                strike = ev.strike
-                window = max(strike.t_end - strike.t_start, dt)
-                dv = np.sqrt(2.0 * strike.energy_j / mass)
-                force_mag = mass * dv / window          # reported impact severity
-                force_phys = mass * min(dv, dv_cap) / window   # capped body push
-                # Land on the face whose outward normal opposes the strike dir.
-                axis = int(np.argmax(np.abs(strike.direction)))
-                offset = np.zeros(3)
-                offset[axis] = -np.sign(strike.direction[axis]) * half[axis]
-                local_point = center_local + offset
-                world_point = R @ local_point + pos
-                engine.apply_impulse(strike.direction * force_phys, world_point)
-                trace.contacts.append(ContactEvent(
-                    time=t_global + t_local, event=ev.name,
-                    pos=world_point, local_pos=local_point, normal=-strike.direction,
-                    normal_force=force_mag, tangential_force=0.0,
-                    rel_speed=dv,
-                    part_index=_nearest_part(bot, world_point, pos, quat),
-                    other="opponent_weapon",
-                ))
+                pos, quat = engine.get_pose()
+                R = _quat_matrix(quat)            # body -> world rotation
 
-            engine.step()
-            _contain(engine, lo, hi, bmin, bmax)
+                # Scheduled opponent strike: physical impulse + synthetic contact.
+                if ev.strike and ev.strike.t_start <= t_local < ev.strike.t_end:
+                    strike = ev.strike
+                    window = max(strike.t_end - strike.t_start, dt)
+                    dv = np.sqrt(2.0 * strike.energy_j / mass)
+                    force_mag = mass * dv / window          # reported impact severity
+                    force_phys = mass * min(dv, dv_cap) / window   # capped body push
+                    # Land on the face whose outward normal opposes the strike dir.
+                    axis = int(np.argmax(np.abs(strike.direction)))
+                    offset = np.zeros(3)
+                    offset[axis] = -np.sign(strike.direction[axis]) * half[axis]
+                    local_point = center_local + offset
+                    world_point = R @ local_point + pos
+                    engine.apply_impulse(strike.direction * force_phys, world_point)
+                    ce = ContactEvent(
+                        time=t_global + t_local, event=ev.name,
+                        pos=world_point, local_pos=local_point, normal=-strike.direction,
+                        normal_force=force_mag, tangential_force=0.0,
+                        rel_speed=dv,
+                        part_index=_nearest_part(bot, world_point, pos, quat),
+                        other="opponent_weapon",
+                    )
+                    trace.contacts.append(ce)
+                    pending.append(ce)
 
-            for c in engine.read_contacts():
-                local_pos = R.T @ (c["pos"] - pos)
-                trace.contacts.append(ContactEvent(
-                    time=t_global + t_local, event=ev.name,
-                    pos=c["pos"], local_pos=local_pos, normal=c["normal"],
-                    normal_force=c["normal_force"],
-                    tangential_force=c["tangential_force"],
-                    rel_speed=c["rel_speed"],
-                    part_index=c["part_index"], other=c["other"],
-                ))
+                engine.step()
+                _contain(engine, lo, hi, bmin, bmax)
 
-            if s % record_every == 0:
-                trace.frames.append(FrameSample(
-                    time=t_global + t_local, pos=pos, quat=quat, event=ev.name))
+                for c in engine.read_contacts():
+                    local_pos = R.T @ (c["pos"] - pos)
+                    ce = ContactEvent(
+                        time=t_global + t_local, event=ev.name,
+                        pos=c["pos"], local_pos=local_pos, normal=c["normal"],
+                        normal_force=c["normal_force"],
+                        tangential_force=c["tangential_force"],
+                        rel_speed=c["rel_speed"],
+                        part_index=c["part_index"], other=c["other"],
+                    )
+                    trace.contacts.append(ce)
+                    pending.append(ce)
 
-        t_global += ev.duration
+                if s % record_every == 0:
+                    frame = FrameSample(
+                        time=t_global + t_local, pos=pos, quat=quat, event=ev.name)
+                    trace.frames.append(frame)
+                    chunk = StreamChunk(
+                        frame=frame, new_contacts=pending,
+                        event_index=ev_index, n_events=n_events,
+                        t_global=t_global + t_local, sim_done=False)
+                    pending = []
+                    yield chunk
+
+            t_global += ev.duration
+
+        # Flush contacts produced after the final captured frame so a streaming
+        # consumer's damage accumulator sees every contact (the trace already
+        # holds them; this only re-emits the un-yielded tail).
+        if pending and trace.frames:
+            yield StreamChunk(
+                frame=trace.frames[-1], new_contacts=pending,
+                event_index=n_events - 1, n_events=n_events,
+                t_global=t_global, sim_done=True)
+            pending = []
+    except GeneratorExit:
+        # Cancelled mid-run: hand back the partial trace built so far.
+        return trace
     return trace
+
+
+def run_battery(engine: SimEngine, battery: StressBattery, fps: int = 30) -> SimTrace:
+    """Run every event, recording bot poses (for replay) and contacts (for
+    damage). A thin drainer over :func:`iter_battery` so the offline path and the
+    live streaming path share one simulation loop."""
+    gen = iter_battery(engine, battery, fps=fps)
+    try:
+        while True:
+            next(gen)
+    except StopIteration as stop:
+        return stop.value

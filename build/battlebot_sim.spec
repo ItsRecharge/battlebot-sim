@@ -47,6 +47,7 @@ datas += [
 
 hiddenimports += [
     "pyvistaqt",
+    "PySide6.QtCharts",     # live metric-vs-time graphs (see ui/charts.py)
     "vtkmodules.qt.QVTKRenderWindowInteractor",
     "vtkmodules.util.numpy_support",
     # scipy 1.17 imports this Cython helper at startup but PyInstaller doesn't
@@ -77,7 +78,8 @@ a = Analysis(
               "PySide6.QtMultimediaWidgets", "PySide6.QtWebEngineCore",
               "PySide6.QtWebEngineWidgets", "PySide6.QtWebChannel",
               "PySide6.QtWebSockets", "PySide6.Qt3DCore", "PySide6.Qt3DRender",
-              "PySide6.QtCharts", "PySide6.QtDataVisualization", "PySide6.QtSql",
+              # NOTE: QtCharts is NOT excluded — the live metric graphs use it.
+              "PySide6.QtDataVisualization", "PySide6.QtSql",
               "PySide6.QtTest", "PySide6.QtBluetooth", "PySide6.QtPositioning",
               "PySide6.QtSensors", "PySide6.QtSerialPort", "PySide6.QtPdf",
               "PySide6.QtPdfWidgets", "PySide6.QtDesigner", "PySide6.QtHelp"],

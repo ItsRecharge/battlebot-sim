@@ -67,3 +67,24 @@ class SimTrace:
 
     def total_contacts(self) -> int:
         return len(self.contacts)
+
+
+@dataclass
+class StreamChunk:
+    """One increment of a *live* battery run, handed from the sim layer to the
+    UI as the run progresses.
+
+    Carries one captured frame plus every contact produced since the previous
+    captured frame. ``frame`` is the same object appended to ``SimTrace.frames``
+    and ``new_contacts`` are already in ``SimTrace.contacts`` — so draining the
+    whole stream rebuilds the identical trace. Plain data only (numpy + the two
+    dataclasses, no engine references) so it is safe to marshal across a Qt
+    queued signal to the UI thread.
+    """
+
+    frame: FrameSample
+    new_contacts: list[ContactEvent]
+    event_index: int           # 0-based index of the event in progress
+    n_events: int              # total events in the battery (for a progress bar)
+    t_global: float            # battery time at this frame (s)
+    sim_done: bool = False     # True on the final tail-flush chunk

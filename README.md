@@ -26,11 +26,17 @@ and two damage heatmaps.
 3. **Tag braces** so the model accounts for structural load-sharing.
 4. **Run the stress battery** — drops, wall slams at several speeds/angles, a tumble, and
    opponent-weapon strikes, all scaled to the weight class, simulated in MuJoCo inside the
-   class-sized cage.
+   class-sized cage. It runs **live**: watch the bot fly around the cage in real time (with a
+   playback-speed control and a Stop button) while four metric-vs-time graphs — peak contact
+   force, cumulative impact energy, worst failure margin, and bot speed/hit-rate — fill in as
+   the impacts happen.
 5. **See the results**:
-   - a **replay** of the bot being flung around the cage,
-   - an **Impact-Energy** heatmap (what took the most punishment),
-   - a **Failure-Margin** heatmap (peak stress ÷ yield; red ≥ 1 means it would yield),
+   - the **live fly-around** in the cage (and a slider to re-scrub it afterwards),
+   - a **separate bot-only view** that auto-rotates the finished bot on a turntable,
+   - an **Impact-Energy** heatmap and a **Failure-Margin** heatmap (peak stress ÷ yield;
+     ≥ 1 means it would yield), rendered as a smooth exponential gradient of hotspots with a
+     labelled key — damage is spread from the real physics-engine contacts, not painted on
+     single triangles,
    - an exportable **report** (two PNG heatmaps + a markdown summary with a per-part table
      and worst impacts).
 

@@ -32,9 +32,23 @@ from battlebot_sim.sim.recorder import SimTrace
 POISSON = 0.3
 _OPPONENT_MODULUS_PA = 200e9   # treat the opponent weapon as steel
 
-# Spatial spread of each contact onto the mesh. Kept tight so the heatmap shows
-# crisp, localized hotspots (smaller sections of the bot) rather than a smear:
-# energy spreads over ~1.2% of the bot diagonal, stress over 40% of that.
+# Spatial spread of each contact onto the mesh. Each impact paints a smooth
+# exponential (Gaussian) hotspot whose sigma is tied to the Hertzian contact-
+# patch radius `a`, with a visibility FLOOR (a fraction of the bot diagonal, plus
+# an absolute minimum) so even a sharp hit reads as a gradient blob instead of a
+# single triangle, and a CAP (a fraction of the struck part) so a tiny part is
+# not swamped. Stress blobs are tighter than energy blobs (damage localises more
+# than absorbed energy). These drive the *appearance*; the peak values (and so
+# the failure verdict) come from the unchanged Hertzian model below.
+SIGMA_PATCH_FACTOR = 8.0      # energy sigma ~ this * Hertzian patch radius a
+SIGMA_MIN_FRAC = 0.025        # floor: sigma >= this * bot diagonal …
+SIGMA_ABS_MIN = 3.0e-3        # … but never below this many metres
+SIGMA_PART_FRAC = 0.5         # cap:  sigma <= this * struck part's max extent
+STRESS_SIGMA_FRAC = 0.4       # stress sigma = this * energy sigma (tighter)
+KERNEL_RADIUS_SIGMAS = 3.0    # gather faces within this many sigma of the hit
+
+# Legacy fixed-spread fractions, used only when an explicit ``energy_falloff`` is
+# passed (overrides the per-contact sigma).
 ENERGY_FALLOFF_FRAC = 0.012
 STRESS_RADIUS_FRAC = 0.4
 
@@ -69,6 +83,13 @@ def _hertzian_peak_pressure(force: float, eff_modulus: float, radius: float) -> 
     return (6.0 * force * eff_modulus**2 / (np.pi**3 * radius**2)) ** (1.0 / 3.0)
 
 
+def _hertzian_patch_radius(force: float, eff_modulus: float, radius: float) -> float:
+    """Radius of the Hertzian contact patch for a sphere-on-flat contact (m):
+    ``a = (3 F R / (4 E*))^(1/3)``. Sets the physical width of an impact's
+    footprint, which the heatmap spreads damage over."""
+    return (3.0 * max(force, 0.0) * radius / (4.0 * max(eff_modulus, 1.0))) ** (1.0 / 3.0)
+
+
 def _other_modulus(other: str, arena: Arena, library: MaterialLibrary) -> float:
     if other == "opponent_weapon":
         return _OPPONENT_MODULUS_PA
@@ -78,6 +99,155 @@ def _other_modulus(other: str, arena: Arena, library: MaterialLibrary) -> float:
         return _OPPONENT_MODULUS_PA
 
 
+class DamageAccumulator:
+    """Builds the per-face damage fields incrementally from contacts.
+
+    This is the single implementation behind both the offline ``compute_damage``
+    (one ``ingest`` of the whole trace) and the live run (the streaming worker
+    calls ``ingest`` per frame-chunk as contacts arrive). Ingesting the same
+    contacts in the same order — whether all at once or in arbitrary
+    consecutive batches — produces identical fields (energy is summed, peak
+    stress is an order-independent max), so the live and offline paths agree.
+    """
+
+    def __init__(
+        self,
+        bot: BotModel,
+        arena: Arena,
+        library: MaterialLibrary,
+        energy_falloff: float | None = None,
+    ):
+        self.bot = bot
+        self.arena = arena
+        self.library = library
+
+        mesh = bot.original
+        self.mesh = mesh
+        self.n_faces = len(mesh.faces)
+        self.centroids = mesh.triangles_center      # (n_faces, 3) body frame
+        self.tree = cKDTree(self.centroids)
+
+        # Per-face owning part + that part's material/radius.
+        self.face_part = np.zeros(self.n_faces, dtype=np.int64)
+        self.part_radius: dict[int, float] = {}
+        self.part_yield: dict[int, float] = {}
+        self.part_modulus: dict[int, float] = {}
+        self.part_char_len: dict[int, float] = {}
+        for p in bot.parts:
+            self.face_part[p.face_ids] = p.index
+            self.part_radius[p.index] = _part_radius(p.volume_m3)
+            ext = np.asarray(p.bounds[1] - p.bounds[0], dtype=float)
+            self.part_char_len[p.index] = float(max(ext.max(), 1e-3))
+            mat = p.material
+            self.part_yield[p.index] = mat.yield_pa if mat else np.inf
+            self.part_modulus[p.index] = mat.youngs_pa if mat else 1.0
+
+        # Spreading sigma config. With an explicit ``energy_falloff`` we keep a
+        # fixed spread (legacy/override); otherwise each contact picks a sigma
+        # from its Hertzian patch radius, floored for visibility (see ingest).
+        self.diag = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
+        self._fixed_sigma = energy_falloff
+        self.sigma_floor = max(SIGMA_MIN_FRAC * self.diag, SIGMA_ABS_MIN)
+
+        self.energy = np.zeros(self.n_faces)
+        self.peak_stress = np.zeros(self.n_faces)
+        # Per-face yield (fixed once parts/materials are set), for cheap margins.
+        self.yield_per_face = np.array(
+            [self.part_yield[int(self.face_part[f])] for f in range(self.n_faces)]
+        )
+
+    def _contact_sigma(self, force: float, eff_E: float, pidx: int) -> float:
+        """The energy-spread Gaussian sigma for one contact (metres).
+
+        Tied to the Hertzian contact-patch radius, then floored for visibility
+        and capped at half the struck part's size."""
+        if self._fixed_sigma is not None:
+            return float(self._fixed_sigma)
+        a = _hertzian_patch_radius(force, eff_E, self.part_radius[pidx])
+        sigma = SIGMA_PATCH_FACTOR * a
+        sigma = max(sigma, self.sigma_floor)
+        sigma = min(sigma, SIGMA_PART_FRAC * self.part_char_len[pidx])
+        return max(sigma, SIGMA_ABS_MIN)
+
+    def ingest(self, contacts, dt: float) -> None:
+        """Fold a batch of contacts into the running energy/stress fields.
+
+        Each contact paints a smooth exponential blob: energy is spread with a
+        conserved Gaussian (weights sum to 1, so the absorbed joules are exact),
+        and contact stress is painted as a Gaussian-weighted peak combined by MAX
+        — a gradient inside the footprint whose centre keeps the full Hertzian p0,
+        so repeated hits never inflate the failure verdict.
+        """
+        for c in contacts:
+            pidx = int(c.part_index)
+            force = abs(c.normal_force)
+            eff_E = _effective_modulus(
+                self.part_modulus[pidx],
+                _other_modulus(c.other, self.arena, self.library),
+            )
+            p0 = _hertzian_peak_pressure(force, eff_E, self.part_radius[pidx])
+            sigma_e = self._contact_sigma(force, eff_E, pidx)
+            sigma_s = STRESS_SIGMA_FRAC * sigma_e
+
+            # --- energy: conserved Gaussian spread over nearby faces ---
+            work = force * max(c.rel_speed, 0.0) * dt
+            if work > 0:
+                idx = self.tree.query_ball_point(
+                    c.local_pos, KERNEL_RADIUS_SIGMAS * sigma_e)
+                if not idx:
+                    idx = [int(self.tree.query(c.local_pos)[1])]
+                d = np.linalg.norm(self.centroids[idx] - c.local_pos, axis=1)
+                w = np.exp(-(d**2) / (2.0 * sigma_e**2))
+                total = float(w.sum())
+                if total > 0:
+                    self.energy[idx] += work * (w / total)
+
+            # --- failure margin: Gaussian-weighted Hertzian peak, MAX-combined ---
+            sidx = self.tree.query_ball_point(
+                c.local_pos, KERNEL_RADIUS_SIGMAS * sigma_s)
+            if not sidx:
+                sidx = [int(self.tree.query(c.local_pos)[1])]
+            ds = np.linalg.norm(self.centroids[sidx] - c.local_pos, axis=1)
+            ws = np.exp(-(ds**2) / (2.0 * sigma_s**2))
+            self.peak_stress[sidx] = np.maximum(self.peak_stress[sidx], p0 * ws)
+
+    def _failure_margin(self) -> np.ndarray:
+        """Per-face peak stress / owning-part yield (0 where yield is non-finite)."""
+        return np.divide(
+            self.peak_stress, self.yield_per_face,
+            out=np.zeros_like(self.peak_stress), where=np.isfinite(self.yield_per_face),
+        )
+
+    def snapshot_face_fields(self) -> tuple[np.ndarray, np.ndarray]:
+        """Cheap (energy, failure_margin) copies of the running fields — for a
+        live view to paint mid-run without touching the accumulator's arrays."""
+        return self.energy.copy(), self._failure_margin()
+
+    def current_max_margin(self) -> float:
+        """Running worst failure margin across all faces (for live metrics)."""
+        fm = self._failure_margin()
+        return float(fm.max()) if fm.size else 0.0
+
+    def finalize(self) -> DamageResult:
+        """Snapshot the accumulated fields into a DamageResult."""
+        failure_margin = self._failure_margin()
+        part_max_margin = {
+            p.index: float(failure_margin[p.face_ids].max()) if len(p.face_ids) else 0.0
+            for p in self.bot.parts
+        }
+        part_total_energy = {
+            p.index: float(self.energy[p.face_ids].sum()) for p in self.bot.parts
+        }
+        return DamageResult(
+            energy_per_face=self.energy,
+            peak_stress_per_face=self.peak_stress,
+            failure_margin_per_face=failure_margin,
+            face_part=self.face_part,
+            part_max_margin=part_max_margin,
+            part_total_energy=part_total_energy,
+        )
+
+
 def compute_damage(
     trace: SimTrace,
     bot: BotModel,
@@ -85,76 +255,11 @@ def compute_damage(
     library: MaterialLibrary,
     energy_falloff: float | None = None,
 ) -> DamageResult:
-    """Build energy + failure-margin fields from a battery trace."""
-    mesh = bot.original
-    n_faces = len(mesh.faces)
-    centroids = mesh.triangles_center           # (n_faces, 3) body frame
-    tree = cKDTree(centroids)
+    """Build energy + failure-margin fields from a complete battery trace.
 
-    # Per-face owning part + that part's material/radius.
-    face_part = np.zeros(n_faces, dtype=np.int64)
-    part_radius = {}
-    part_yield = {}
-    part_modulus = {}
-    for p in bot.parts:
-        face_part[p.face_ids] = p.index
-        part_radius[p.index] = _part_radius(p.volume_m3)
-        mat = p.material
-        part_yield[p.index] = mat.yield_pa if mat else np.inf
-        part_modulus[p.index] = mat.youngs_pa if mat else 1.0
-
-    # Falloff radius for energy spreading: a small fraction of the bot's size.
-    if energy_falloff is None:
-        diag = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
-        energy_falloff = max(diag * ENERGY_FALLOFF_FRAC, 5e-3)
-    stress_radius = energy_falloff * STRESS_RADIUS_FRAC
-
-    energy = np.zeros(n_faces)
-    peak_stress = np.zeros(n_faces)
-
-    for c in trace.contacts:
-        pidx = int(c.part_index)
-        # --- energy: spread work over nearby faces (Gaussian weights) ---
-        work = abs(c.normal_force) * max(c.rel_speed, 0.0) * trace.dt
-        if work > 0:
-            idx = tree.query_ball_point(c.local_pos, energy_falloff)
-            if not idx:
-                idx = [int(tree.query(c.local_pos)[1])]
-            d = np.linalg.norm(centroids[idx] - c.local_pos, axis=1)
-            w = np.exp(-(d**2) / (2.0 * (energy_falloff / 2.0) ** 2))
-            w = w / w.sum()
-            energy[idx] += work * w
-
-        # --- failure margin: Hertzian peak pressure at the impact site ---
-        eff_E = _effective_modulus(
-            part_modulus[pidx], _other_modulus(c.other, arena, library)
-        )
-        p0 = _hertzian_peak_pressure(abs(c.normal_force), eff_E, part_radius[pidx])
-        sidx = tree.query_ball_point(c.local_pos, stress_radius)
-        if not sidx:
-            sidx = [int(tree.query(c.local_pos)[1])]
-        peak_stress[sidx] = np.maximum(peak_stress[sidx], p0)
-
-    # Failure margin = peak stress / owning part's yield.
-    yield_per_face = np.array([part_yield[int(face_part[f])] for f in range(n_faces)])
-    failure_margin = np.divide(
-        peak_stress, yield_per_face,
-        out=np.zeros_like(peak_stress), where=np.isfinite(yield_per_face),
-    )
-
-    part_max_margin = {
-        p.index: float(failure_margin[p.face_ids].max()) if len(p.face_ids) else 0.0
-        for p in bot.parts
-    }
-    part_total_energy = {
-        p.index: float(energy[p.face_ids].sum()) for p in bot.parts
-    }
-
-    return DamageResult(
-        energy_per_face=energy,
-        peak_stress_per_face=peak_stress,
-        failure_margin_per_face=failure_margin,
-        face_part=face_part,
-        part_max_margin=part_max_margin,
-        part_total_energy=part_total_energy,
-    )
+    A thin wrapper over DamageAccumulator so the offline report/selftest path and
+    the live streaming path share one implementation.
+    """
+    acc = DamageAccumulator(bot, arena, library, energy_falloff)
+    acc.ingest(trace.contacts, trace.dt)
+    return acc.finalize()

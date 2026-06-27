@@ -16,6 +16,7 @@ import numpy as np
 import pyvista as pv
 
 from battlebot_sim.damage.model import DamageResult
+from battlebot_sim.damage.fields import vertex_scalars
 from battlebot_sim.mesh.segment import BotModel
 
 FIELD_SPECS = {
@@ -87,25 +88,123 @@ def face_field_values(result: DamageResult, mode: str) -> np.ndarray:
     return np.asarray(fv, dtype=float)
 
 
-def attach_field(poly: pv.PolyData, bot: BotModel, result: DamageResult, mode: str):
-    """Attach a per-face field to a PolyData for crisp per-cell colouring.
+def _subdiv_level(n_faces: int, target: int = 20000) -> int:
+    """How many times to linearly subdivide a mesh so a per-face damage field has
+    enough resolution to read as a smooth gradient — coarse hulls (tens of faces)
+    get subdivided up; already-dense meshes are left alone."""
+    n, f = 0, max(int(n_faces), 1)
+    while f * 4 <= target and n < 3:
+        f *= 4
+        n += 1
+    return n
 
-    Returns ``(cmap, clim, title, log_scale)``. Impact energy accumulates with
-    every hit and spans orders of magnitude, so it is coloured on a log scale
-    (real joules stay on the bar); failure margin stays linear so the yield
-    threshold (margin = 1) keeps its meaning.
+
+def scalar_bar_spec(mode: str, title: str | None = None) -> dict:
+    """Args for a clean, readable heatmap key (the colour-bar legend)."""
+    spec = FIELD_SPECS[mode]
+    return {
+        "title": title or spec["title"], "color": "#1b2733",
+        "n_labels": 5, "fmt": "%.2g", "vertical": True,
+        "title_font_size": 16, "label_font_size": 13,
+    }
+
+
+def heat_mesh_kwargs(mode, cmap, clim, title, log_scale) -> dict:
+    """``add_mesh`` kwargs shared by the live viewport, the bot-only view and the
+    report PNG so all three render the heatmap identically: vertex-interpolated
+    point scalars (a smooth exponential gradient, not per-triangle cells), a
+    neutral colour for undamaged geometry, and the key/legend."""
+    kwargs = dict(
+        scalars=mode, preference="point", cmap=cmap, clim=clim, log_scale=log_scale,
+        interpolate_before_map=True, smooth_shading=True, show_edges=False,
+        nan_color=UNASSIGNED_COLOR, nan_opacity=1.0,
+        # Lighting on (smooth shading needs it) but ambient-heavy/low-specular so
+        # the colour — not the studio rig — carries the damage reading.
+        ambient=0.30, diffuse=0.68, specular=0.10,
+        scalar_bar_args=scalar_bar_spec(mode, title),
+    )
+    if mode == "failure":
+        kwargs["annotations"] = {1.0: "YIELD"}   # mark the yield threshold on the bar
+    return kwargs
+
+
+def _faces_to_pv(faces: np.ndarray) -> np.ndarray:
+    """Triangle array (n, 3) -> PyVista flat face stream [3, i, j, k, 3, ...]."""
+    faces = np.asarray(faces, dtype=np.int64)
+    return np.hstack(
+        [np.full((len(faces), 1), 3, dtype=np.int64), faces]).ravel()
+
+
+def _subdivide_field(verts, faces, vert_vals, levels):
+    """Midpoint-subdivide a triangle mesh ``levels`` times, carrying a per-vertex
+    scalar along (linear interpolation at the new edge-midpoint vertices).
+
+    Uses trimesh's per-triangle subdivision, which — unlike VTK's subdivision
+    filters — does not require a manifold mesh, so it works on the bot's union of
+    disjoint parts. Returns ``(new_verts, new_faces, new_vals)``.
     """
-    vals = face_field_values(result, mode)
-    poly.cell_data[mode] = vals
-    poly.set_active_scalars(mode, preference="cell")
+    import trimesh
+    v = np.asarray(verts, dtype=float)
+    f = np.asarray(faces)
+    # Keep the scalar as a 2D (n, 1) column across iterations: trimesh mangles a
+    # 1D attribute after the first subdivision (it comes back reshaped), which
+    # breaks the next level on real meshes. A column stays well-formed.
+    s = np.asarray(vert_vals, dtype=float).reshape(-1, 1)
+    for _ in range(levels):
+        v, f, attrs = trimesh.remesh.subdivide(v, f, vertex_attributes={"s": s})
+        s = np.asarray(attrs["s"], dtype=float).reshape(-1, 1)
+    return v, f, s.reshape(-1)
+
+
+def attach_field_smooth(
+    base_poly: pv.PolyData, bot: BotModel, result: DamageResult, mode: str,
+    subdivisions: int | None = None,
+):
+    """Build a render-ready, vertex-smoothed copy of the bot carrying a damage
+    field as POINT scalars — a continuous exponential gradient instead of flat
+    per-triangle cells. Coarse meshes are midpoint-subdivided first (geometry
+    preserved) so the gradient has somewhere to live, and undamaged geometry is
+    set to NaN so it renders neutral and the hotspots pop.
+
+    Returns ``(heat_poly, cmap, clim, title, log_scale)``. Energy spans orders of
+    magnitude so it is log-scaled (real joules stay on the bar); failure margin
+    stays linear so the yield threshold (margin = 1) keeps its meaning.
+    """
+    face_vals = face_field_values(result, mode)
+    verts = np.asarray(bot.original.vertices, dtype=float)
+    faces = np.asarray(bot.original.faces)
+    vert_vals = vertex_scalars(faces, len(verts), face_vals)
+
+    levels = _subdiv_level(len(faces)) if subdivisions is None else int(subdivisions)
+    sv, sf, svals = verts, faces, vert_vals
+    if levels > 0:
+        try:
+            sv, sf, svals = _subdivide_field(verts, faces, vert_vals, levels)
+            if len(svals) != len(sv):          # defensive: shape mismatch -> bail
+                sv, sf, svals = verts, faces, vert_vals
+        except Exception as exc:               # fall back to the coarse mesh, but say so
+            import warnings
+            warnings.warn(f"heatmap subdivision failed ({exc}); "
+                          "rendering on the un-subdivided mesh.")
+            sv, sf, svals = verts, faces, vert_vals
+
+    heat = pv.PolyData(sv, _faces_to_pv(sf))
+    positive = svals[svals > 0]
+    disp = svals.astype(float).copy()
+    disp[disp <= 0] = np.nan                   # undamaged -> neutral nan_color
+    heat.point_data[mode] = disp
+    heat.set_active_scalars(mode, preference="point")
+
     spec = FIELD_SPECS[mode]
     if mode == "failure":
-        return spec["cmap"], [0.0, max(1.0, float(vals.max()))], spec["title"], False
-    vmax = float(vals.max())
-    if vmax <= 0.0:                       # nothing took any energy yet
-        return spec["cmap"], [0.0, 1e-9], "Impact Energy (J)", False
-    vmin = float(vals[vals > 0].min())   # log scale needs a positive floor
-    return spec["cmap"], [vmin, vmax], spec["title"], True
+        vmax = float(positive.max()) if positive.size else 0.0
+        return heat, spec["cmap"], [0.0, max(1.0, vmax)], spec["title"], False
+    if positive.size == 0:                      # nothing took any energy yet
+        return heat, spec["cmap"], [0.0, 1e-9], "Impact Energy (J)", False
+    vmin, vmax = float(positive.min()), float(positive.max())
+    if vmax <= vmin:
+        vmax = vmin * 1.0001 + 1e-12            # log scale needs vmax > vmin > 0
+    return heat, spec["cmap"], [vmin, vmax], spec["title"], True
 
 
 def render_heatmap_png(
@@ -116,20 +215,14 @@ def render_heatmap_png(
     size: tuple[int, int] = (960, 720),
 ) -> str:
     """Render one heatmap to a PNG off-screen. Returns the path written."""
-    poly = bot_polydata(bot)
-    cmap, clim, title, log_scale = attach_field(poly, bot, result, mode)
+    base = bot_polydata(bot)
+    heat, cmap, clim, title, log_scale = attach_field_smooth(base, bot, result, mode)
     plotter = pv.Plotter(off_screen=True, window_size=list(size))
     plotter.set_background("#c7d0d9", top="#eef2f6")
-    plotter.add_mesh(
-        poly, scalars=mode, cmap=cmap, clim=clim, log_scale=log_scale,
-        preference="cell", interpolate_before_map=False, show_edges=False,
-        scalar_bar_args={"title": title, "color": "#1b2733", "n_labels": 5,
-                         "fmt": "%.2g", "vertical": True},
-    )
+    plotter.add_mesh(heat, **heat_mesh_kwargs(mode, cmap, clim, title, log_scale))
     if mode == "failure":
-        # Mark the failure threshold (margin = 1) as a labelled contour-ish note.
-        plotter.add_text("red >= yield", position="upper_right", font_size=10,
-                         color="#1b2733")
+        plotter.add_text("margin ≥ 1.0 = yields", position="upper_right",
+                         font_size=10, color="#1b2733")
     # This is a single-renderer offscreen image, so depth-based effects are safe
     # here (unlike the live two-layer viewport): SSAA + SSAO add realistic depth.
     try:

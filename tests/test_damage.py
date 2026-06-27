@@ -166,3 +166,30 @@ def test_no_braces_is_noop():
     )
     out = apply_brace_sharing(result, bot)
     assert np.allclose(out.peak_stress_per_face, peak)
+
+
+def test_accumulator_batched_matches_oneshot():
+    """Ingesting contacts in arbitrary consecutive batches must equal a single
+    one-shot ingest — the guarantee that the live stream and the offline path
+    produce identical damage fields."""
+    from battlebot_sim.damage.model import DamageAccumulator
+
+    library = load_default_library()
+    cls = NHRL_CLASSES["3lb"]
+    arena = build_arena(cls)
+    bot = _braced_bot(library)
+    engine = SimEngine(arena, bot)
+    trace = run_battery(engine, StressBattery(arena, cls), fps=30)
+
+    one = compute_damage(trace, bot, arena, library)
+
+    acc = DamageAccumulator(bot, arena, library)
+    contacts = trace.contacts
+    for i in range(0, len(contacts), 7):           # odd batch size on purpose
+        acc.ingest(contacts[i:i + 7], trace.dt)
+    batched = acc.finalize()
+
+    assert np.allclose(one.energy_per_face, batched.energy_per_face)
+    assert np.allclose(one.peak_stress_per_face, batched.peak_stress_per_face)
+    assert np.allclose(one.failure_margin_per_face, batched.failure_margin_per_face)
+    assert one.part_max_margin == batched.part_max_margin

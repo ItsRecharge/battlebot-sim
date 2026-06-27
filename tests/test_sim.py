@@ -140,3 +140,88 @@ def test_overweight_bot_still_simulates(aluminum):
     for _ in range(200):
         engine.step()
     assert np.all(np.isfinite(engine.get_pose()[0]))
+
+
+# ---- streaming generator ---------------------------------------------------
+
+def _drain(gen):
+    """Run a generator to exhaustion; return its StopIteration value."""
+    try:
+        while True:
+            next(gen)
+    except StopIteration as stop:
+        return stop.value
+
+
+def test_iter_battery_emits_every_contact_exactly_once(aluminum):
+    """Each contact in the final trace was streamed in exactly one chunk (same
+    object), so a live consumer that ingests chunks never drops or double-counts."""
+    from battlebot_sim.sim.battery import iter_battery
+
+    wc = NHRL_CLASSES["3lb"]
+    arena = build_arena(wc)
+    bot = _make_bot(aluminum)
+    engine = SimEngine(arena, bot)
+    gen = iter_battery(engine, StressBattery(arena, wc, n_trials=1, seed=0), fps=30)
+
+    streamed, n_chunks = [], 0
+    try:
+        while True:
+            chunk = next(gen)
+            n_chunks += 1
+            assert 0 <= chunk.event_index < chunk.n_events
+            streamed.extend(chunk.new_contacts)
+    except StopIteration as stop:
+        trace = stop.value
+
+    assert n_chunks > 0
+    assert len(trace.frames) > 0
+    assert len(streamed) == len(trace.contacts)
+    # Identity, not equality: the chunk holds the very objects in the trace.
+    assert all(a is b for a, b in zip(streamed, trace.contacts))
+
+
+def test_iter_battery_trace_matches_run_battery(aluminum):
+    """Draining the generator yields a trace identical (deterministically) to the
+    run_battery drainer on a fresh engine."""
+    from battlebot_sim.sim.battery import iter_battery
+
+    wc = NHRL_CLASSES["3lb"]
+    arena = build_arena(wc)
+
+    e1 = SimEngine(arena, _make_bot(aluminum))
+    t_run = run_battery(e1, StressBattery(arena, wc, n_trials=1, seed=0), fps=30)
+
+    e2 = SimEngine(arena, _make_bot(aluminum))
+    t_iter = _drain(iter_battery(e2, StressBattery(arena, wc, n_trials=1, seed=0), fps=30))
+
+    assert t_iter is not None
+    assert len(t_run.frames) == len(t_iter.frames)
+    assert len(t_run.contacts) == len(t_iter.contacts)
+
+
+def test_iter_battery_cancel_returns_partial_trace(aluminum):
+    """Closing the generator mid-run finalizes and returns the partial trace."""
+    from battlebot_sim.sim.battery import iter_battery
+
+    wc = NHRL_CLASSES["3lb"]
+    arena = build_arena(wc)
+    bot = _make_bot(aluminum)
+    engine = SimEngine(arena, bot)
+    gen = iter_battery(engine, StressBattery(arena, wc, n_trials=1, seed=0), fps=30)
+
+    for _ in range(5):
+        next(gen)
+    try:
+        partial = gen.throw(GeneratorExit)
+    except StopIteration as stop:
+        partial = stop.value
+    except GeneratorExit:
+        partial = None
+
+    assert partial is not None
+    assert len(partial.frames) >= 5
+    # A full run has many more frames than the 5 we consumed before cancelling.
+    full = _drain(iter_battery(SimEngine(arena, _make_bot(aluminum)),
+                               StressBattery(arena, wc, n_trials=1, seed=0), fps=30))
+    assert len(partial.frames) < len(full.frames)

@@ -126,6 +126,8 @@ class BotViewport(QtInteractor):
         if press is None or self.bot is None or self.bot_actor is None \
                 or self._face_part is None:
             return
+        if self._mode != "solid":
+            return                       # picking only meaningful on the solid bot
         x, y = obj.GetEventPosition()
         if abs(x - press[0]) > 3 or abs(y - press[1]) > 3:
             return                       # a drag (rotate/pan), not a click
@@ -138,13 +140,22 @@ class BotViewport(QtInteractor):
         additive = bool(obj.GetControlKey() or obj.GetShiftKey())
         self.part_clicked.emit(idx, additive)
 
-    def _set_bot_actor(self, **kwargs) -> None:
+    def _set_bot_actor(self, mesh=None, **kwargs) -> None:
         """(Re)create the bot actor on the base renderer, dropping the previous
         one. Depth peeling handles the cage's translucent walls, so the bot no
-        longer needs a separate always-on-top renderer."""
+        longer needs a separate always-on-top renderer. ``mesh`` defaults to the
+        solid pick mesh; the heatmap passes a smoothed/subdivided copy."""
         if self.bot_actor is not None:
             self.remove_actor(self.bot_actor, render=False)
-        self.bot_actor = self.add_mesh(self.poly, **kwargs)
+        self.bot_actor = self.add_mesh(mesh if mesh is not None else self.poly, **kwargs)
+
+    def _clear_scalar_bars(self) -> None:
+        """Drop any heatmap colour-bars so toggling fields doesn't stack them."""
+        try:
+            for title in list(self.scalar_bars.keys()):
+                self.remove_scalar_bar(title, render=False)
+        except Exception:
+            pass
 
     # ---- scene setup -----------------------------------------------------
     def set_bot(self, bot: BotModel) -> None:
@@ -167,6 +178,7 @@ class BotViewport(QtInteractor):
         """Paint the bot by each part's assigned material (neutral grey where no
         material is set yet) using per-face RGB cell colours. A modest specular
         highlight gives the surface a realistic machined-metal sheen."""
+        self._clear_scalar_bars()              # drop any heatmap key when going solid
         self.poly.cell_data["material_rgb"] = viz.face_material_colors(self.bot)
         self._set_bot_actor(scalars="material_rgb", rgb=True, preference="cell",
                             show_scalar_bar=False, show_edges=False,
@@ -266,6 +278,32 @@ class BotViewport(QtInteractor):
         self.add_text(text, position="upper_left", font_size=12,
                       color="#1b2733", name="event_label")
 
+    def begin_live(self) -> None:
+        """Prepare the viewport for a live run: show the solid bot at rest and
+        clear any stale heatmap/caption so the fly-around starts clean."""
+        if self.bot is None or self.poly is None:
+            return
+        self._mode = "solid"
+        self._last_event = None
+        self.set_event_label("")
+        self._show_solid()                         # solid material view, rest pose
+        self.render()
+
+    def show_live_pose(self, pos, quat, event: str = "") -> None:
+        """Pose the bot at a live (pos, quat) as the battery streams — the
+        real-time fly-around. Same mechanism as replay's show_frame, but driven
+        by the worker's frames instead of the slider."""
+        if self.bot_actor is None:
+            return
+        m = _matrix(pos, quat)
+        self.bot_actor.user_matrix = m
+        if self._highlight_actor is not None:
+            self._highlight_actor.user_matrix = m
+        if event and event != self._last_event:
+            self._last_event = event
+            self.set_event_label(f"▶  {event}")
+        self.render()
+
     def show_frame(self, i: int) -> None:
         """Pose the bot at recorded frame i (used during replay)."""
         if not self.trace or self.bot_actor is None or self.n_frames == 0:
@@ -295,15 +333,132 @@ class BotViewport(QtInteractor):
             self._show_solid()                    # also re-applies the rest pose
             self.set_selection(self._selection)   # keep selection visible + render
             return
-        cmap, clim, title, log_scale = viz.attach_field(
-            self.poly, self.bot, self.result, mode)
-        # Per-cell colouring (no vertex smoothing) for crisp, localized hotspots.
-        self._set_bot_actor(
-            scalars=mode, cmap=cmap, clim=clim, log_scale=log_scale,
-            preference="cell", interpolate_before_map=False, lighting=False,
-            scalar_bar_args={"title": title, "color": "#1b2733", "n_labels": 5,
-                             "fmt": "%.2g", "vertical": True},
-        )
         self._clear_highlight()                   # selection irrelevant on a heatmap
+        self._clear_scalar_bars()                 # avoid stacking energy+failure bars
+        self._last_event = None
+        self.set_event_label("")                  # drop the stale live/replay caption
+        # Vertex-smoothed, subdivided field -> a continuous exponential gradient
+        # of hotspots with a labelled key, instead of flat per-triangle cells.
+        heat, cmap, clim, title, log_scale = viz.attach_field_smooth(
+            self.poly, self.bot, self.result, mode)
+        self._set_bot_actor(
+            mesh=heat, **viz.heat_mesh_kwargs(mode, cmap, clim, title, log_scale))
         self.bot_actor.user_matrix = self._rest_matrix
         self.render()
+
+
+class BotOnlyView(QtInteractor):
+    """A second, lightweight 3D view of *just the bot* — no cage, no floor, no
+    picking, no SSAO/depth-peeling (one opaque actor).
+
+    During setup and the live run it shows the solid bot at rest (the cage view
+    owns the live fly-around). When a run finishes it paints the final damage
+    heatmap with its key and slowly auto-rotates it on a turntable, so the user
+    gets a clean, framed, animated read of where the bot took damage — separate
+    from the busy in-cage scene.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.bot: BotModel | None = None
+        self.poly = None
+        self.result: DamageResult | None = None
+        self._mode = "failure"          # which field the turntable shows
+        self._actor = None
+        self._rest = np.eye(4)
+        self.set_background("#c7d0d9", top="#eef2f6")
+        try:
+            self.enable_anti_aliasing("ssaa")
+        except Exception:
+            pass
+        self._spin = QtCore.QTimer(self)
+        self._spin.setInterval(33)      # ~30 Hz turntable
+        self._spin.timeout.connect(self._turntable)
+
+    # ---- scene ----------------------------------------------------------
+    def set_bot(self, bot: BotModel) -> None:
+        self._spin.stop()
+        self.bot = bot
+        self.poly = viz.bot_polydata(bot)
+        self.result = None
+        self._rest = rest_matrix(float(bot.original.bounds[0][2]))
+        self._show_solid()
+        self.reset_camera()             # frame just the bot, so it fills the view
+        self.render()
+
+    def _clear_scalar_bars(self) -> None:
+        try:
+            for title in list(self.scalar_bars.keys()):
+                self.remove_scalar_bar(title, render=False)
+        except Exception:
+            pass
+
+    def _show_solid(self) -> None:
+        if self.bot is None or self.poly is None:
+            return
+        if self._actor is not None:
+            self.remove_actor(self._actor, render=False)
+        self._clear_scalar_bars()
+        self.poly.cell_data["material_rgb"] = viz.face_material_colors(self.bot)
+        self._actor = self.add_mesh(
+            self.poly, scalars="material_rgb", rgb=True, preference="cell",
+            show_scalar_bar=False, show_edges=False,
+            ambient=0.2, diffuse=0.85, specular=0.3, specular_power=18)
+        self._actor.user_matrix = self._rest
+
+    def refresh_materials(self) -> None:
+        """Re-colour the solid bot after a material change (ignored once a result
+        heatmap is showing)."""
+        if self.bot is None or self.result is not None:
+            return
+        self._show_solid()
+        self.render()
+
+    def begin_live(self) -> None:
+        """Idle (solid bot, no spin) while the cage view runs the live battery."""
+        self._spin.stop()
+        self.result = None
+        if self.bot is not None:
+            self._show_solid()
+            self.render()
+
+    # ---- final heatmap turntable ---------------------------------------
+    def show_final(self, result: DamageResult, mode: str = "failure") -> None:
+        """Paint the final damage field and start the auto-rotating turntable."""
+        self.result = result
+        self._mode = mode if mode in ("energy", "failure") else "failure"
+        self._paint_heatmap()
+        self._spin.start()
+
+    def set_mode(self, mode: str) -> None:
+        """Follow the results panel's field toggle (energy / failure / solid)."""
+        if mode == "solid" or self.result is None:
+            self._spin.stop()
+            if self.bot is not None:
+                self._show_solid()
+                self.render()
+            return
+        self._mode = mode
+        self._paint_heatmap()
+        if not self._spin.isActive():
+            self._spin.start()
+
+    def _paint_heatmap(self) -> None:
+        if self.bot is None or self.poly is None or self.result is None:
+            return
+        if self._actor is not None:
+            self.remove_actor(self._actor, render=False)
+        self._clear_scalar_bars()
+        heat, cmap, clim, title, log_scale = viz.attach_field_smooth(
+            self.poly, self.bot, self.result, self._mode)
+        self._actor = self.add_mesh(
+            heat, **viz.heat_mesh_kwargs(self._mode, cmap, clim, title, log_scale))
+        self._actor.user_matrix = self._rest
+        self.render()
+
+    def _turntable(self) -> None:
+        try:
+            self.camera.Azimuth(0.6)        # vtkCamera method (degrees)
+            self.render()
+        except Exception:
+            pass
