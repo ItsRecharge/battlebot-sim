@@ -2,67 +2,144 @@
 
 from __future__ import annotations
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
+from battlebot_sim import viz
 from battlebot_sim.materials.assign import NHRL_CLASSES
 from battlebot_sim.materials.library import MaterialLibrary
 from battlebot_sim.mesh.segment import BotModel
 
 
 class PartsPanel(QtWidgets.QGroupBox):
-    """A table of parts with per-part material + brace selection."""
+    """A table of parts with per-part material + brace selection, plus 3D-linked
+    multi-select and bulk material assignment."""
 
-    changed = QtCore.Signal()       # emitted when any material/brace changes
+    changed = QtCore.Signal()                 # any material/brace change
+    selection_changed = QtCore.Signal(list)   # selected part indices (from table)
 
     def __init__(self, library: MaterialLibrary, parent=None):
         super().__init__("Parts & Materials", parent)
         self.library = library
         self.bot: BotModel | None = None
+        self._syncing = False                 # guard against selection echo loops
 
         self.table = QtWidgets.QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["Part", "Material", "Brace", "Mass (kg)"])
         self.table.horizontalHeader().setSectionResizeMode(
             1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        # Multi-select rows: lets several parts be bulk-assigned at once and keeps
+        # 3D picks and the table in sync.
+        self.table.setSelectionBehavior(
+            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.table.itemSelectionChanged.connect(self._on_selection_changed)
+
+        self.hint = QtWidgets.QLabel(
+            "Tip: click a part in the 3D view to open its material dropdown, or "
+            "Ctrl/Shift-click to multi-select then “Assign to selected”. "
+            "Type in a dropdown to search materials.")
+        self.hint.setWordWrap(True)
+        self.hint.setStyleSheet("color:#57606a")
+
+        # Bulk assignment row.
+        self.bulk_combo = self._make_material_combo()
+        self.assign_sel_btn = QtWidgets.QPushButton("Assign to selected")
+        self.assign_all_btn = QtWidgets.QPushButton("Assign to all")
+        self.assign_sel_btn.clicked.connect(self._assign_to_selected)
+        self.assign_all_btn.clicked.connect(self._assign_to_all)
+        bulk = QtWidgets.QHBoxLayout()
+        bulk.addWidget(self.bulk_combo, 1)
+        bulk.addWidget(self.assign_sel_btn)
+        bulk.addWidget(self.assign_all_btn)
+
+        # Explicit confirm/recalc control (masses already update live).
+        self.recalc_btn = QtWidgets.QPushButton("Recalculate weight")
+        self.recalc_btn.clicked.connect(self._recalculate)
 
         self.total_label = QtWidgets.QLabel("Total mass: —")
         self.class_label = QtWidgets.QLabel("")
         self.class_label.setWordWrap(True)
 
         layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(self.hint)
         layout.addWidget(self.table)
+        layout.addLayout(bulk)
+        layout.addWidget(self.recalc_btn)
         layout.addWidget(self.total_label)
         layout.addWidget(self.class_label)
 
     def set_bot(self, bot: BotModel) -> None:
         self.bot = bot
-        self.table.setRowCount(len(bot.parts))
-        for p in bot.parts:
-            self.table.setItem(p.index, 0, QtWidgets.QTableWidgetItem(p.name))
+        # Populate with our own signals muted so applying N default materials
+        # fires `changed`/`selection_changed` once (below), not once per part.
+        self.blockSignals(True)
+        try:
+            self.table.clearSelection()
+            self.table.setRowCount(len(bot.parts))
+            for p in bot.parts:
+                name_item = QtWidgets.QTableWidgetItem(p.name)
+                name_item.setToolTip(f"Part {p.index}: {p.name}")
+                self.table.setItem(p.index, 0, name_item)
 
-            combo = QtWidgets.QComboBox()
-            combo.addItems(self.library.names())
-            combo.currentTextChanged.connect(
-                lambda name, idx=p.index: self._on_material(idx, name))
-            self.table.setCellWidget(p.index, 1, combo)
+                combo = self._make_material_combo()
+                combo.currentTextChanged.connect(
+                    lambda name, idx=p.index: self._on_material(idx, name))
+                self.table.setCellWidget(p.index, 1, combo)
 
-            check = QtWidgets.QCheckBox()
-            check.stateChanged.connect(
-                lambda state, idx=p.index: self._on_brace(idx, state))
-            holder = QtWidgets.QWidget()
-            hl = QtWidgets.QHBoxLayout(holder)
-            hl.addWidget(check)
-            hl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            hl.setContentsMargins(0, 0, 0, 0)
-            self.table.setCellWidget(p.index, 2, holder)
+                check = QtWidgets.QCheckBox()
+                check.stateChanged.connect(
+                    lambda state, idx=p.index: self._on_brace(idx, state))
+                holder = QtWidgets.QWidget()
+                hl = QtWidgets.QHBoxLayout(holder)
+                hl.addWidget(check)
+                hl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                hl.setContentsMargins(0, 0, 0, 0)
+                self.table.setCellWidget(p.index, 2, holder)
 
-            self.table.setItem(p.index, 3, QtWidgets.QTableWidgetItem("—"))
-            # Apply the default (first) material immediately.
-            self._on_material(p.index, combo.currentText())
+                self.table.setItem(p.index, 3, QtWidgets.QTableWidgetItem("—"))
+                # Apply the default (first) material immediately.
+                self._on_material(p.index, combo.currentText())
+        finally:
+            self.blockSignals(False)
+        self.changed.emit()
+
+    def _make_material_combo(self) -> QtWidgets.QComboBox:
+        """A material picker that shows full names and filters as you type."""
+        combo = QtWidgets.QComboBox()
+        combo.addItems(self.library.names())
+        combo.setEditable(True)
+        combo.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
+        completer = combo.completer()
+        completer.setCompletionMode(
+            QtWidgets.QCompleter.CompletionMode.PopupCompletion)
+        completer.setFilterMode(QtCore.Qt.MatchFlag.MatchContains)
+        completer.setCaseSensitivity(QtCore.Qt.CaseSensitivity.CaseInsensitive)
+        return combo
+
+    def focus_material_editor(self, idx: int) -> None:
+        """Bring a part's material combo into view and open it for editing —
+        used when a single part is picked in the 3D view."""
+        item = self.table.item(idx, 0)
+        if item is not None:
+            self.table.scrollToItem(item)
+        combo = self.table.cellWidget(idx, 1)
+        if combo is not None:
+            combo.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+            combo.showPopup()
+
+    def _recalculate(self) -> None:
+        """Force a fresh mass / weight-class computation on demand. Live updates
+        already keep this current; the button gives an explicit confirm step."""
+        self._refresh_masses()
+        self.changed.emit()
 
     def _on_material(self, idx: int, name: str) -> None:
-        if self.bot is None:
+        # Editable combos emit on every keystroke; only commit real materials.
+        if self.bot is None or name not in self.library:
             return
         self.bot.assign_material(idx, self.library.get(name))
+        self._apply_swatch(idx)
         self._refresh_masses()
         self.changed.emit()
 
@@ -85,12 +162,87 @@ class PartsPanel(QtWidgets.QGroupBox):
         color = "#1a7f37" if ok else "#cf222e"
         self.class_label.setText(f"<span style='color:{color}'>{message}</span>")
 
+    # ---- colour swatches -------------------------------------------------
+    def _apply_swatch(self, idx: int) -> None:
+        """Paint the part's name cell with its material colour so the table is a
+        legend for the 3D view."""
+        item = self.table.item(idx, 0)
+        if item is None or self.bot is None:
+            return
+        mat = self.bot.parts[idx].material
+        if mat is None:
+            return
+        r, g, b = viz.material_color(mat.name)
+        item.setBackground(QtGui.QColor(int(r * 255), int(g * 255), int(b * 255)))
+
+    # ---- bulk assignment -------------------------------------------------
+    def _assign_to_selected(self) -> None:
+        self._assign_material_to(self.selected_indices(), self.bulk_combo.currentText())
+
+    def _assign_to_all(self) -> None:
+        if self.bot is not None:
+            self._assign_material_to([p.index for p in self.bot.parts],
+                                     self.bulk_combo.currentText())
+
+    def _assign_material_to(self, indices, name: str) -> None:
+        """Set one material on many parts in a single action — model, per-row
+        combos and swatches — then refresh once."""
+        if self.bot is None or not indices or name not in self.library:
+            return
+        mat = self.library.get(name)
+        for idx in indices:
+            combo = self.table.cellWidget(idx, 1)
+            if combo is not None:
+                combo.blockSignals(True)
+                combo.setCurrentText(name)
+                combo.blockSignals(False)
+            self.bot.assign_material(idx, mat)
+            self._apply_swatch(idx)
+        self._refresh_masses()
+        self.changed.emit()
+
+    # ---- selection sync with the 3D view ---------------------------------
+    def selected_indices(self) -> list[int]:
+        return sorted({ix.row() for ix in self.table.selectionModel().selectedRows()})
+
+    def _on_selection_changed(self) -> None:
+        if not self._syncing:
+            self.selection_changed.emit(self.selected_indices())
+
+    def select_parts(self, indices) -> None:
+        """Set the table selection from a 3D pick, without echoing it back out."""
+        sm = self.table.selectionModel()
+        model = self.table.model()
+        self._syncing = True
+        try:
+            sm.clearSelection()
+            if indices:
+                sel = QtCore.QItemSelection()
+                last = self.table.columnCount() - 1
+                for idx in indices:
+                    sel.select(model.index(idx, 0), model.index(idx, last))
+                sm.select(sel, QtCore.QItemSelectionModel.SelectionFlag.Select)
+                self.table.scrollToItem(self.table.item(indices[0], 0))
+        finally:
+            self._syncing = False
+
 
 class SetupPanel(QtWidgets.QGroupBox):
     """Load STL, choose weight class & units, and run the battery."""
 
     load_requested = QtCore.Signal(str, float)   # path, scale_to_m
     run_requested = QtCore.Signal(str)            # weight class key
+
+    # STL import units -> factor converting one source unit to metres. Listed in
+    # the order shown in the dropdown (metric first, then imperial); millimetres
+    # stays first as the most common STL export unit.
+    UNIT_SCALES_M = {
+        "millimetres": 1e-3,
+        "centimetres": 1e-2,
+        "metres": 1.0,
+        "inches": 0.0254,
+        "feet": 0.3048,
+    }
 
     def __init__(self, parent=None):
         super().__init__("Setup", parent)
@@ -99,38 +251,69 @@ class SetupPanel(QtWidgets.QGroupBox):
             self.class_combo.addItem(wc.name, key)
 
         self.unit_combo = QtWidgets.QComboBox()
-        self.unit_combo.addItems(["millimetres", "centimetres", "metres"])
+        self.unit_combo.addItems(list(self.UNIT_SCALES_M))
 
-        self.load_btn = QtWidgets.QPushButton("Load STL…")
+        self.load_btn = QtWidgets.QPushButton("Load model…")
+        self.sample_btn = QtWidgets.QPushButton("Load sample bot")
+        self.sample_btn.setToolTip(
+            "Load the bundled demo bot to try the full pipeline immediately.")
+        self.trials_spin = QtWidgets.QSpinBox()
+        self.trials_spin.setRange(1, 50)
+        self.trials_spin.setValue(1)
+        self.trials_spin.setToolTip(
+            "More trials test more impact angles and orientations (a systematic "
+            "sweep plus seeded random extras). Damage accumulates across every "
+            "trial into one worst-case map. Higher = more thorough but slower.")
+
         self.run_btn = QtWidgets.QPushButton("Run stress battery")
         self.run_btn.setEnabled(False)
+        self.run_btn.setToolTip("Load a model first.")
+        self.cage_check = QtWidgets.QCheckBox("Show arena cage during setup")
+        self.cage_check.setToolTip(
+            "Off by default so parts are easy to see and click; the cage always "
+            "appears when you run the battery.")
         self.progress = QtWidgets.QProgressBar()
         self.progress.setRange(0, 0)            # busy indicator
         self.progress.hide()
 
         form = QtWidgets.QFormLayout(self)
         form.addRow("Weight class:", self.class_combo)
-        form.addRow("STL units:", self.unit_combo)
+        form.addRow("Model units:", self.unit_combo)
         form.addRow(self.load_btn)
+        form.addRow(self.sample_btn)
+        form.addRow("Trials:", self.trials_spin)
         form.addRow(self.run_btn)
+        form.addRow(self.cage_check)
         form.addRow(self.progress)
 
         self.load_btn.clicked.connect(self._choose_file)
+        self.sample_btn.clicked.connect(self._load_sample)
         self.run_btn.clicked.connect(
             lambda: self.run_requested.emit(self.class_combo.currentData()))
 
     def _scale_to_m(self) -> float:
-        return {"millimetres": 1e-3, "centimetres": 1e-2, "metres": 1.0}[
-            self.unit_combo.currentText()]
+        return self.UNIT_SCALES_M[self.unit_combo.currentText()]
 
     def _choose_file(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Open STL", "", "STL files (*.stl);;All files (*)")
+            self, "Open model", "",
+            "Models (*.stl *.3mf *.gltf *.glb *.obj);;"
+            "STL (*.stl);;3MF (*.3mf);;glTF (*.gltf *.glb);;OBJ (*.obj);;"
+            "All files (*)")
         if path:
             self.load_requested.emit(path, self._scale_to_m())
 
+    def _load_sample(self) -> None:
+        """Load the bundled demo bot. It is authored in metres, so it ignores
+        the units dropdown (scale 1.0) and gives an instant known-good run."""
+        from battlebot_sim.mesh.segment import sample_bot_path
+        self.load_requested.emit(sample_bot_path(), 1.0)
+
     def current_class_key(self) -> str:
         return self.class_combo.currentData()
+
+    def current_trials(self) -> int:
+        return int(self.trials_spin.value())
 
 
 class ResultsPanel(QtWidgets.QGroupBox):

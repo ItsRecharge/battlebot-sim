@@ -12,7 +12,9 @@ warn the user.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import trimesh
@@ -20,18 +22,69 @@ import trimesh
 from battlebot_sim.materials.library import Material
 
 
+def sample_bot_path() -> str:
+    """Absolute path to the bundled sample bot STL, resolved in both dev and
+    frozen (.exe) runs. Shared by the entry-point self-test and the UI's
+    'Load sample bot' action so they can never drift apart."""
+    if getattr(sys, "frozen", False):
+        base = Path(getattr(sys, "_MEIPASS"))     # PyInstaller unpack dir
+    else:
+        base = Path(__file__).resolve().parents[2]
+    return str(base / "data" / "sample_bots" / "wedge_bot.stl")
+
+
+def _hull_or_none(mesh: trimesh.Trimesh):
+    """Convex hull of a non-watertight part (used for volume/inertia), or None
+    when the geometry is too degenerate for a hull.
+
+    Real CAD STL exports routinely contain stray single triangles or collinear
+    slivers as separate connected components. Those have <4 non-coplanar points,
+    so scipy's Qhull raises ``QhullError`` ("not enough points to construct
+    initial simplex"). Such artifacts carry no meaningful volume, so we treat a
+    failed hull as "no volume" rather than letting the error abort the load.
+    """
+    try:
+        # Building/repairing the hull of a near-flat sliver integrates moments
+        # that divide by ~0; keep that internal float noise out of the output.
+        with np.errstate(invalid="ignore", divide="ignore"):
+            return mesh.convex_hull
+    except Exception:       # scipy QhullError (and friends) on degenerate input
+        return None
+
+
+def _finite_centroid(mesh: trimesh.Trimesh) -> np.ndarray:
+    """A finite centroid for a part, even when its area is ~0 (which makes the
+    area-weighted ``mesh.centroid`` non-finite). Falls back to the vertex mean."""
+    c = np.asarray(mesh.centroid, dtype=float)
+    if not np.all(np.isfinite(c)):
+        c = np.asarray(mesh.vertices, dtype=float).mean(axis=0)
+    return c
+
+
 def _mass_properties(mesh: trimesh.Trimesh, density: float):
     """Return (mass_kg, center_mass(3,), inertia(3,3)) for `mesh` at `density`.
 
     Inertia is taken about the mesh's own centre of mass. Falls back to the
     convex hull when the mesh is not watertight (volume otherwise unreliable).
+    Degenerate / zero-volume parts yield zero mass with a *finite* centroid so a
+    stray sliver can never poison the bot's aggregate centre of mass or inertia
+    (``0 * NaN = NaN`` would otherwise corrupt the whole bot).
     """
-    source = mesh if mesh.is_watertight else mesh.convex_hull
+    source = mesh if mesh.is_watertight else _hull_or_none(mesh)
+    if source is None or float(source.volume) <= 0.0:
+        return 0.0, _finite_centroid(mesh), np.zeros((3, 3))
     source = source.copy()
     source.density = float(density)
-    mass = float(source.mass)
-    com = np.asarray(source.center_mass, dtype=float)
-    inertia = np.asarray(source.moment_inertia, dtype=float)
+    # A joggled hull of a near-flat sliver can have a tiny positive volume whose
+    # moment integration divides by ~0; compute under errstate and discard any
+    # non-finite result below rather than emitting a spurious RuntimeWarning.
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mass = float(source.mass)
+        com = np.asarray(source.center_mass, dtype=float)
+        inertia = np.asarray(source.moment_inertia, dtype=float)
+    if not (np.isfinite(mass) and np.all(np.isfinite(com))
+            and np.all(np.isfinite(inertia))):
+        return 0.0, _finite_centroid(mesh), np.zeros((3, 3))
     return mass, com, inertia
 
 
@@ -60,8 +113,13 @@ class Part:
 
     @property
     def volume_m3(self) -> float:
-        src = self.mesh if self.mesh.is_watertight else self.mesh.convex_hull
-        return abs(float(src.volume))
+        if self.mesh.is_watertight:
+            return abs(float(self.mesh.volume))
+        hull = _hull_or_none(self.mesh)
+        if hull is None:
+            return 0.0
+        with np.errstate(invalid="ignore", divide="ignore"):
+            return abs(float(hull.volume))
 
     @property
     def surface_area_m2(self) -> float:
@@ -187,12 +245,68 @@ class BotModel:
         return all(p.material is not None for p in self.parts)
 
 
+def segment_scene(scene: trimesh.Scene, scale_to_m: float = 1.0):
+    """Build ``(original_mesh, parts)`` from a multi-body scene — one Part per
+    placed geometry instance.
+
+    The geometry's name (the CAD body name) becomes the Part name and the
+    assembly transform is baked into the vertices, so a 3MF/glTF export keeps
+    each body distinct and named instead of collapsing to ``part_0``. Face ids
+    index into the concatenated ``original`` so the damage pipeline (which walks
+    ``bot.original`` + ``Part.face_ids``) is unchanged.
+    """
+    meshes: list[trimesh.Trimesh] = []
+    parts: list[Part] = []
+    offset = 0
+    for node in scene.graph.nodes_geometry:
+        transform, geom_name = scene.graph[node]
+        geom = scene.geometry[geom_name].copy()
+        geom.apply_transform(transform)
+        if scale_to_m != 1.0:
+            geom.apply_scale(float(scale_to_m))
+        n = len(geom.faces)
+        if n == 0:
+            continue
+        parts.append(Part(
+            index=len(parts), mesh=geom,
+            face_ids=np.arange(offset, offset + n, dtype=np.int64),
+            name=str(geom_name),
+        ))
+        meshes.append(geom)
+        offset += n
+    original = trimesh.util.concatenate(meshes) if meshes else trimesh.Trimesh()
+    return original, parts
+
+
 def load_bot(path: str, scale_to_m: float = 1.0) -> BotModel:
-    """Load an STL from `path`, scale into metres, and segment it into parts."""
-    mesh = trimesh.load(path, force="mesh")
-    if not isinstance(mesh, trimesh.Trimesh):
-        raise ValueError(f"{path!r} did not load as a single triangle mesh")
-    if scale_to_m != 1.0:
-        mesh.apply_scale(float(scale_to_m))
+    """Load a bot mesh from `path`, scale into metres, and segment it into parts.
+
+    Two input styles are supported:
+
+    - **Named multi-body** (``.glb`` / ``.gltf``, ``.3mf``): each body becomes a
+      Part that keeps its CAD name — the best way to tell parts apart for
+      per-part material assignment.
+    - **Single mesh** (``.stl``, or an ``.obj`` trimesh merges): split into parts
+      by connected components and named ``part_0``, ``part_1`` ...
+
+    STEP/IGES/Parasolid/JT/ACIS need a CAD kernel trimesh does not bundle; export
+    3MF or glTF from the CAD tool instead.
+    """
+    loaded = trimesh.load(path)
+    if isinstance(loaded, trimesh.Scene):
+        original, parts = segment_scene(loaded, scale_to_m)
+        if len(parts) >= 2:
+            return BotModel(original=original, parts=parts)
+        # One body (no per-part names to keep): fall back to connected
+        # components on the already-scaled mesh, matching STL behaviour.
+        mesh = original
+    else:
+        mesh = loaded
+        if not isinstance(mesh, trimesh.Trimesh):
+            raise ValueError(f"{path!r} did not load as a mesh or scene")
+        if scale_to_m != 1.0:
+            mesh.apply_scale(float(scale_to_m))
+    if len(mesh.faces) == 0:
+        raise ValueError(f"{path!r} contains no faces")
     parts = segment_mesh(mesh)
     return BotModel(original=mesh, parts=parts)

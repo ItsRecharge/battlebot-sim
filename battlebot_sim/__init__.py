@@ -5,4 +5,4 @@ stress battery in the MuJoCo physics engine, and visualize where the bot takes
 the most damage via two heatmaps (accumulated impact energy and failure margin).
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "battlebot-sim"
-version = "0.1.0"
+version = "0.1.1"
 description = "Impact-damage simulator for combat robots: assign materials to an STL, run an NHRL stress battery, and view damage heatmaps."
 requires-python = ">=3.10,<3.13"
 dependencies = [
@@ -12,6 +12,7 @@ dependencies = [
     "scipy>=1.10",
     "trimesh>=4.0",
     "networkx>=3.0",       # used by trimesh for graph splits
+    "lxml>=4.9",           # required by trimesh to read 3MF (named multi-body CAD exports)
     "mujoco>=3.1",         # rigid-body physics engine (prebuilt Windows wheels)
     "pyvista>=0.43",
     "pyvistaqt>=0.11",

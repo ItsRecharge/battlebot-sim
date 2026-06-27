@@ -4,7 +4,9 @@ and the damage heatmaps."""
 from __future__ import annotations
 
 import numpy as np
+from PySide6 import QtCore
 from pyvistaqt import QtInteractor
+from vtkmodules.vtkRenderingCore import vtkCellPicker
 
 from battlebot_sim import viz
 from battlebot_sim.arena.nhrl import Arena
@@ -23,37 +25,218 @@ def _matrix(pos, quat) -> np.ndarray:
     return M
 
 
+def rest_matrix(min_z: float, clearance: float = 1e-3) -> np.ndarray:
+    """Translation that lifts a mesh so its lowest point sits on the floor (z=0).
+
+    The bot's body-frame geometry generally dips below z=0, so in the static
+    rest pose it would poke through the cage floor when viewed from below. This
+    shifts it up by ``-min_z`` (plus a hair of clearance). Replay uses the real
+    world poses from physics and ignores this.
+    """
+    M = np.eye(4)
+    M[2, 3] = -float(min_z) + clearance
+    return M
+
+
 class BotViewport(QtInteractor):
     """A QtInteractor that renders the bot, arena, replay and heatmaps."""
 
+    # Emitted when the user clicks a part: (part_index, additive). `additive` is
+    # True when Ctrl/Shift is held (extend the selection) rather than replace it.
+    part_clicked = QtCore.Signal(int, bool)
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.set_background("white")
         self.bot: BotModel | None = None
         self.poly = None
         self.bot_actor = None
         self.trace: SimTrace | None = None
         self.result: DamageResult | None = None
         self._mode = "solid"   # "solid" | "energy" | "failure"
+        self._face_part: np.ndarray | None = None   # cell id -> part index
+        self._selection: set[int] = set()
+        self._highlight_actor = None
+        self._arena_shown = False
+        # Lift applied to the bot in its static rest pose so it sits ON the floor
+        # (z=0) instead of poking through it. Recomputed per bot in set_bot().
+        self._rest_matrix = np.eye(4)
+        self._last_event: str | None = None     # last replay event captioned
+        self._init_picking()
+        self._setup_studio()                     # realistic lighting + AA + backdrop
+
+    def _setup_studio(self) -> None:
+        """A clean, realistic 'studio' look: a soft gradient backdrop, screen-
+        space anti-aliasing, SSAO, and neutral three-point lighting.
+
+        Everything (bot and cage) lives on the single base renderer, so real
+        depth ordering applies: the opaque floor occludes the (opaque) bot when
+        the camera is below the cage, while the translucent walls composite
+        over/under it in the standard transparency pass so it still reads clearly
+        through them from above and the side. This single shared depth buffer is
+        what fixes the old overlay's "bot always on top" artifact; depth peeling
+        is enabled as a best-effort refinement for translucent-on-translucent
+        ordering (it no-ops when the SSAA/SSAO passes own the render pipeline).
+        """
+        import pyvista as pv
+        # Soft neutral gradient (lighter at top) — reads as a photographic
+        # backdrop rather than a flat white void.
+        self.set_background("#c7d0d9", top="#eef2f6")
+        try:
+            self.enable_anti_aliasing("ssaa")
+        except Exception:
+            pass
+        # Best-effort order-independent transparency for overlapping cage walls.
+        try:
+            self.enable_depth_peeling(number_of_peels=8, occlusion_ratio=0.0)
+        except Exception:
+            pass
+        try:
+            self.enable_ssao(radius=0.05)
+        except Exception:
+            pass
+        # Neutral three-point rig: warm key, cool fill, cool back/rim.
+        rig = (
+            dict(position=(6.0, -6.0, 8.0), color=(1.0, 0.97, 0.92), intensity=0.95),
+            dict(position=(-7.0, -3.0, 4.0), color=(0.90, 0.94, 1.0), intensity=0.45),
+            dict(position=(0.0, 7.0, 5.0), color=(0.96, 0.98, 1.0), intensity=0.55),
+        )
+        self.renderer.RemoveAllLights()
+        for spec in rig:
+            light = pv.Light(position=spec["position"], focal_point=(0, 0, 0),
+                             color=spec["color"], intensity=spec["intensity"])
+            light.positional = False              # distant/directional: even lighting
+            self.renderer.AddLight(light)
+
+    def _init_picking(self) -> None:
+        """Left-click selects the part under the cursor. We pick against the base
+        renderer (where the bot actor lives) and ignore drags so camera rotation
+        still works. A press+release within a few pixels is a click."""
+        self._picker = vtkCellPicker()
+        self._picker.SetTolerance(0.001)
+        self._press_xy = None
+        iren = self.iren.interactor
+        iren.AddObserver("LeftButtonPressEvent", self._on_press)
+        iren.AddObserver("LeftButtonReleaseEvent", self._on_release)
+
+    def _on_press(self, obj, event) -> None:
+        self._press_xy = obj.GetEventPosition()
+
+    def _on_release(self, obj, event) -> None:
+        press, self._press_xy = self._press_xy, None
+        if press is None or self.bot is None or self.bot_actor is None \
+                or self._face_part is None:
+            return
+        x, y = obj.GetEventPosition()
+        if abs(x - press[0]) > 3 or abs(y - press[1]) > 3:
+            return                       # a drag (rotate/pan), not a click
+        self._picker.Pick(x, y, 0, self.renderer)
+        if self._picker.GetActor() is not self.bot_actor:
+            return                       # clicked empty space
+        idx = viz.part_at_cell(self._face_part, self._picker.GetCellId())
+        if idx is None:
+            return
+        additive = bool(obj.GetControlKey() or obj.GetShiftKey())
+        self.part_clicked.emit(idx, additive)
+
+    def _set_bot_actor(self, **kwargs) -> None:
+        """(Re)create the bot actor on the base renderer, dropping the previous
+        one. Depth peeling handles the cage's translucent walls, so the bot no
+        longer needs a separate always-on-top renderer."""
+        if self.bot_actor is not None:
+            self.remove_actor(self.bot_actor, render=False)
+        self.bot_actor = self.add_mesh(self.poly, **kwargs)
 
     # ---- scene setup -----------------------------------------------------
     def set_bot(self, bot: BotModel) -> None:
         self.bot = bot
         self.poly = viz.bot_polydata(bot)
-        if self.bot_actor is not None:
-            self.remove_actor(self.bot_actor)
-        self.bot_actor = self.add_mesh(self.poly, color="#9aa6b2", show_edges=False)
+        self._face_part = viz.face_part_array(bot)
+        # Lift the bot so it rests on the floor (z=0) in the static pose.
+        self._rest_matrix = rest_matrix(float(bot.original.bounds[0][2]))
+        self._last_event = None
+        self.set_event_label("")               # clear any stale replay caption
+        self._clear_highlight()
+        self._selection = set()
+        self._mode = "solid"
+        self._show_solid()                 # colour by material from the start
         self.add_axes(color="black")
         self.reset_camera()
         self.render()
 
+    def _show_solid(self) -> None:
+        """Paint the bot by each part's assigned material (neutral grey where no
+        material is set yet) using per-face RGB cell colours. A modest specular
+        highlight gives the surface a realistic machined-metal sheen."""
+        self.poly.cell_data["material_rgb"] = viz.face_material_colors(self.bot)
+        self._set_bot_actor(scalars="material_rgb", rgb=True, preference="cell",
+                            show_scalar_bar=False, show_edges=False,
+                            ambient=0.18, diffuse=0.85, specular=0.35,
+                            specular_power=18)
+        self.bot_actor.user_matrix = self._rest_matrix
+
+    def refresh_materials(self) -> None:
+        """Re-colour after a material assignment (solid view only)."""
+        if self.bot is None or self.poly is None or self._mode != "solid":
+            return
+        self._show_solid()                    # also re-applies the rest pose
+        self.set_selection(self._selection)   # rebuild highlight on top + render
+
+    # ---- selection -------------------------------------------------------
+    def set_selection(self, indices) -> None:
+        """Highlight the given part indices (driven by a 3D click or the table).
+        Rebuilds a single bright overlay of just those parts' faces."""
+        self._selection = {int(i) for i in indices}
+        self._clear_highlight()
+        if (self.bot is None or self.poly is None or self._face_part is None
+                or not self._selection):
+            self.render()
+            return
+        cell_ids = np.nonzero(np.isin(self._face_part, list(self._selection)))[0]
+        if len(cell_ids):
+            sel = self.poly.extract_cells(cell_ids)
+            actor = self.add_mesh(
+                sel, color="#ffcc00", show_edges=True, edge_color="#7a5b00",
+                line_width=2, show_scalar_bar=False, reset_camera=False)
+            if self.bot_actor is not None:
+                actor.user_matrix = self.bot_actor.user_matrix
+            self._highlight_actor = actor
+        self.render()
+
+    def _clear_highlight(self) -> None:
+        if self._highlight_actor is not None:
+            self.remove_actor(self._highlight_actor, render=False)
+            self._highlight_actor = None
+
+    # ---- arena cage ------------------------------------------------------
     def show_arena(self, arena: Arena) -> None:
         for g in arena.geoms:
             box = self._box(g.center, g.half_extents)
             opacity = 1.0 if g.role == "floor" else 0.12
             color = "#5b6168" if g.role == "floor" else "#88a0c0"
-            self.add_mesh(box, color=color, opacity=opacity, name=f"arena_{g.name}")
+            self.add_mesh(box, color=color, opacity=opacity, name=f"arena_{g.name}",
+                          ambient=0.2, diffuse=0.8, specular=0.1)
+        self._add_floor_grid(arena)
+        self._arena_shown = True
         self.reset_camera()
+        self.render()
+
+    def _add_floor_grid(self, arena: Arena) -> None:
+        """A faint grid on the floor plane: reinforces scale and makes the floor
+        read as a solid surface (named ``arena_*`` so hide_arena clears it too)."""
+        import pyvista as pv
+        L, W, _H = arena.interior
+        grid = pv.Plane(center=(0.0, 0.0, 0.002), direction=(0.0, 0.0, 1.0),
+                        i_size=L, j_size=W, i_resolution=12, j_resolution=12)
+        self.add_mesh(grid, style="wireframe", color="#8b949d", opacity=0.35,
+                      line_width=1, name="arena_grid", show_scalar_bar=False,
+                      reset_camera=False, lighting=False)
+
+    def hide_arena(self) -> None:
+        """Remove the arena cage so parts are easy to see and click during setup.
+        The bot, axes and any selection stay."""
+        for name in [n for n in self.renderer.actors if n.startswith("arena_")]:
+            self.remove_actor(name, render=False)
+        self._arena_shown = False
         self.render()
 
     @staticmethod
@@ -72,13 +255,30 @@ class BotViewport(QtInteractor):
     def n_frames(self) -> int:
         return len(self.trace.frames) if self.trace else 0
 
+    def set_event_label(self, text: str) -> None:
+        """Caption the current replay event in the corner (empty text clears it)."""
+        if not text:
+            try:
+                self.remove_actor("event_label", render=False)
+            except Exception:
+                pass
+            return
+        self.add_text(text, position="upper_left", font_size=12,
+                      color="#1b2733", name="event_label")
+
     def show_frame(self, i: int) -> None:
         """Pose the bot at recorded frame i (used during replay)."""
         if not self.trace or self.bot_actor is None or self.n_frames == 0:
             return
         i = max(0, min(i, self.n_frames - 1))
         f = self.trace.frames[i]
-        self.bot_actor.user_matrix = _matrix(f.pos, f.quat)
+        m = _matrix(f.pos, f.quat)
+        self.bot_actor.user_matrix = m
+        if self._highlight_actor is not None:
+            self._highlight_actor.user_matrix = m
+        if f.event != self._last_event:           # caption updates on event change
+            self._last_event = f.event
+            self.set_event_label(f"▶  {f.event}")
         self.render()
 
     # ---- heatmaps --------------------------------------------------------
@@ -91,15 +291,19 @@ class BotViewport(QtInteractor):
         if self.bot is None or self.poly is None:
             return
         self._mode = mode
-        if self.bot_actor is not None:
-            self.remove_actor(self.bot_actor)
         if mode == "solid" or self.result is None:
-            self.bot_actor = self.add_mesh(self.poly, color="#9aa6b2")
-        else:
-            cmap, clim, title = viz.attach_field(self.poly, self.bot, self.result, mode)
-            self.bot_actor = self.add_mesh(
-                self.poly, scalars=mode, cmap=cmap, clim=clim,
-                scalar_bar_args={"title": title, "color": "black"},
-            )
-        self.bot_actor.user_matrix = np.eye(4)
+            self._show_solid()                    # also re-applies the rest pose
+            self.set_selection(self._selection)   # keep selection visible + render
+            return
+        cmap, clim, title, log_scale = viz.attach_field(
+            self.poly, self.bot, self.result, mode)
+        # Per-cell colouring (no vertex smoothing) for crisp, localized hotspots.
+        self._set_bot_actor(
+            scalars=mode, cmap=cmap, clim=clim, log_scale=log_scale,
+            preference="cell", interpolate_before_map=False, lighting=False,
+            scalar_bar_args={"title": title, "color": "#1b2733", "n_labels": 5,
+                             "fmt": "%.2g", "vertical": True},
+        )
+        self._clear_highlight()                   # selection irrelevant on a heatmap
+        self.bot_actor.user_matrix = self._rest_matrix
         self.render()

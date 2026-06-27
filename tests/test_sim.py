@@ -7,17 +7,25 @@ from battlebot_sim.arena.nhrl import build_arena
 from battlebot_sim.materials.assign import NHRL_CLASSES
 from battlebot_sim.mesh.segment import BotModel, segment_mesh
 from battlebot_sim.sim.engine import SimEngine
-from battlebot_sim.sim.battery import StressBattery, run_battery
+from battlebot_sim.sim.battery import (
+    StressBattery, run_battery, class_strike_energy,
+)
 
 
-def _make_bot(aluminum):
-    """A two-cube + brace bot, all aluminium, in metres."""
+def _make_bot(aluminum, offset=(0.0, 0.0, 0.0)):
+    """A two-cube + brace bot, all aluminium, in metres.
+
+    ``offset`` translates the whole mesh so the geometry centre no longer sits at
+    the body origin — exercises the containment clamp's AABB anchoring.
+    """
     a = trimesh.creation.box(extents=(0.08, 0.08, 0.05))
     a.apply_translation((-0.10, 0, 0))
     b = trimesh.creation.box(extents=(0.08, 0.08, 0.05))
     b.apply_translation((0.10, 0, 0))
     bar = trimesh.creation.box(extents=(0.12, 0.02, 0.02))
     combined = trimesh.util.concatenate([a, b, bar])
+    if any(offset):
+        combined.apply_translation(offset)
     model = BotModel(combined, segment_mesh(combined))
     model.assign_material_to_all(aluminum)
     return model
@@ -67,6 +75,60 @@ def test_full_battery_runs(aluminum):
         assert np.isfinite(c.normal_force)
     # The opponent strike should be represented.
     assert any(c.other == "opponent_weapon" for c in trace.contacts)
+
+
+def _assert_contained(trace, bot, arena, tol=0.05):
+    """Every recorded bot pose keeps the bot's AABB inside the cage interior."""
+    L, W, H = arena.interior
+    lo = np.array([-L / 2.0, -W / 2.0, 0.0])
+    hi = np.array([L / 2.0, W / 2.0, H])
+    bmin, bmax = bot.original.bounds[0], bot.original.bounds[1]
+    for f in trace.frames:
+        assert np.all(f.pos + bmin >= lo - tol), \
+            f"bot escaped low at event {f.event}: pos={f.pos}"
+        assert np.all(f.pos + bmax <= hi + tol), \
+            f"bot escaped high at event {f.event}: pos={f.pos}"
+
+
+def test_battery_keeps_bot_in_chamber(aluminum):
+    # Worst case: heaviest class (fastest launches), extra trials, fixed seed.
+    wc = NHRL_CLASSES["30lb"]
+    arena = build_arena(wc)
+    bot = _make_bot(aluminum)
+    engine = SimEngine(arena, bot)
+    trace = run_battery(engine, StressBattery(arena, wc, n_trials=2, seed=0))
+    _assert_contained(trace, bot, arena)
+
+
+def test_containment_handles_offset_bot(aluminum):
+    # Body origin != geometry centre: the clamp must anchor on pos + bounds.
+    wc = NHRL_CLASSES["30lb"]
+    arena = build_arena(wc)
+    bot = _make_bot(aluminum, offset=(0.2, 0.0, 0.1))
+    engine = SimEngine(arena, bot)
+    trace = run_battery(engine, StressBattery(arena, wc, n_trials=2, seed=0))
+    _assert_contained(trace, bot, arena)
+
+
+def test_strike_damage_severity_unchanged_by_force_cap(aluminum):
+    # Capping the physical launch must NOT change the reported impact severity
+    # (normal_force / rel_speed) that the damage model reads.
+    wc = NHRL_CLASSES["30lb"]
+    arena = build_arena(wc)
+    bot = _make_bot(aluminum)
+    engine = SimEngine(arena, bot)
+    trace = run_battery(engine, StressBattery(arena, wc, n_trials=1, seed=0))
+
+    mass = max(bot.total_mass(), 1e-6)
+    dv = np.sqrt(2.0 * class_strike_energy(wc) / mass)
+    window = 0.01                          # strike t_end - t_start
+    expected_force = mass * dv / window
+
+    strikes = [c for c in trace.contacts if c.other == "opponent_weapon"]
+    assert strikes, "no opponent-weapon contact recorded"
+    for c in strikes:
+        assert np.isclose(c.rel_speed, dv, rtol=1e-6)
+        assert np.isclose(c.normal_force, expected_force, rtol=1e-6)
 
 
 def test_overweight_bot_still_simulates(aluminum):

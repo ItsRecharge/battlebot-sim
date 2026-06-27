@@ -1,10 +1,10 @@
 # BattleBot Damage Simulator
 
 A Windows desktop app that predicts **where a combat robot will take damage** before
-you cut any metal. Load your bot's STL, assign real materials to its parts, pick an
-NHRL weight class, and the app runs your bot through an automated "flinging" stress
-battery inside a physics-simulated test cage — then shows you a replay and two damage
-heatmaps.
+you cut any metal. Load your bot's model (STL, 3MF, or glTF), assign real materials to
+its parts, pick an NHRL weight class, and the app runs your bot through an automated
+"flinging" stress battery inside a physics-simulated test cage — then shows you a replay
+and two damage heatmaps.
 
 > **Hybrid-accuracy tool.** A real rigid-body physics engine (MuJoCo) handles the
 > flinging and collisions; a simplified analytical model (Hertzian contact stress +
@@ -13,10 +13,16 @@ heatmaps.
 
 ## What it does
 
-1. **Load STL** → auto-segments into connected solid parts (chassis, armor, wedge, brace…).
+1. **Load a model** → a named multi-body file (3MF / glTF) keeps each body as its own
+   part with its CAD name; an STL is auto-segmented into connected solid parts named
+   `part_0`, `part_1`… (chassis, armor, wedge, brace…). Or hit **Load sample bot** to try
+   the whole pipeline instantly.
 2. **Assign materials** per part from a library (aluminums, steels, titanium, polycarbonate,
-   UHMW, HDPE, TPU, carbon fiber — all editable). Mass, centre of mass, and inertia are
-   computed and **validated against the NHRL weight class** (3 / 12 / 30 lb).
+   UHMW, HDPE, TPU, carbon fiber — all editable). **Click parts in the 3D view to select
+   them** (Ctrl/Shift to multi-select), then assign a material to the whole selection at
+   once; each part is tinted by its material so the table doubles as a legend. Mass, centre
+   of mass, and inertia are computed and **validated against the NHRL weight class**
+   (3 / 12 / 30 lb).
 3. **Tag braces** so the model accounts for structural load-sharing.
 4. **Run the stress battery** — drops, wall slams at several speeds/angles, a tumble, and
    opponent-weapon strikes, all scaled to the weight class, simulated in MuJoCo inside the
@@ -28,6 +34,21 @@ heatmaps.
    - an exportable **report** (two PNG heatmaps + a markdown summary with a per-part table
      and worst impacts).
 
+## Input formats
+
+| Format | Part segmentation | Recommended |
+|--------|-------------------|-------------|
+| **3MF** | Each named body → one part, keeps the CAD name | ✅ best for multi-part bots |
+| **glTF / GLB** | Each named node → one part, keeps the name | ✅ |
+| **STL** | Auto-split by connected components, generic `part_N` names | ok (no names) |
+| **OBJ** | Merged on import → connected-component split | ok (no names) |
+
+Export **3MF** (or glTF) from your CAD — Fusion 360, SolidWorks, Onshape, FreeCAD and
+Blender all do — so every body arrives as a distinct, named part you can pick and assign
+individually. STEP/IGES/Parasolid/JT/ACIS need a CAD kernel this app doesn't bundle;
+convert them to 3MF/glTF first. Units aren't carried by STL (and vary by exporter), so set
+the **Model units** dropdown to match your file.
+
 ## Run from source
 
 Requires Python 3.10–3.12 on Windows.
@@ -38,7 +59,8 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m battlebot_sim
 ```
 
-A sample bot is included at `data/sample_bots/wedge_bot.stl`.
+A sample bot is included at `data/sample_bots/wedge_bot.stl` — or just click **Load
+sample bot** in the app.
 
 ## Build the standalone .exe
 
@@ -59,7 +81,7 @@ $env:QT_QPA_PLATFORM = "offscreen"
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-All 29 tests pass. See the stability note below if a run aborts.
+All 45 tests pass. See the stability note below if a run aborts.
 
 ## Known issue: intermittent native-DLL crash on this machine
 
@@ -102,7 +124,7 @@ rare crash launching the app, relaunch it.
 
 ```
 battlebot_sim/
-  mesh/segment.py      STL load, connected-component segmentation, mass properties
+  mesh/segment.py      STL/3MF/glTF load, named-body + connected-component segmentation, mass properties
   materials/           material library + NHRL classes + weight validation
   arena/nhrl.py        class-scaled cage geometry
   sim/                 MJCF builder, MuJoCo engine wrapper, stress battery, recorder

@@ -49,6 +49,15 @@ class BatteryEvent:
     strike: Strike | None = None
 
 
+# An opponent strike delivers its full energy to the *damage* model, but the
+# *physical* launch is capped to a multiple of the class speed so the bot bounces
+# around the cage instead of being fired clean through a wall (see run_battery).
+STRIKE_DV_CAP_FACTOR = 1.5
+# Restitution applied when the containment safety-net reflects the bot off an
+# interior wall: a gentle bounce reads more naturally than a dead stop.
+CONTAIN_RESTITUTION = 0.3
+
+
 def class_speed(wc: WeightClass) -> float:
     """Representative collision speed (m/s) for a class."""
     return {"3lb": 6.0, "12lb": 8.0, "30lb": 10.0}.get(wc.key, 7.0)
@@ -59,12 +68,36 @@ def class_strike_energy(wc: WeightClass) -> float:
     return 200.0 * wc.max_mass_kg
 
 
-class StressBattery:
-    """Builds and holds the list of events for a class + arena."""
+def _random_unit(rng: np.random.Generator) -> np.ndarray:
+    """A seeded random unit vector."""
+    v = rng.normal(size=3)
+    n = float(np.linalg.norm(v))
+    return v / n if n > 1e-9 else np.array([1.0, 0.0, 0.0])
 
-    def __init__(self, arena: Arena, weight_class: WeightClass):
+
+def _random_quats(rng: np.random.Generator, n: int) -> list[np.ndarray]:
+    """``n`` seeded random orientations as MuJoCo (w, x, y, z) quaternions."""
+    from scipy.spatial.transform import Rotation
+    q = np.atleast_2d(Rotation.random(n, random_state=rng).as_quat())  # (n, xyzw)
+    return [np.array([row[3], row[0], row[1], row[2]]) for row in q]
+
+
+class StressBattery:
+    """Builds and holds the list of events for a class + arena.
+
+    ``n_trials`` scales how many impact angles/orientations are tested: a
+    systematic sweep (evenly-spaced wall-slam incidences fired toward walls all
+    around the bot) plus that many seeded *random* extra drops, tumbles and
+    weapon strikes. The seed makes the whole battery reproducible. Damage from
+    every event accumulates into one worst-case map (see compute_damage).
+    """
+
+    def __init__(self, arena: Arena, weight_class: WeightClass,
+                 n_trials: int = 1, seed: int = 0):
         self.arena = arena
         self.weight_class = weight_class
+        self.n_trials = max(1, int(n_trials))
+        self.rng = np.random.default_rng(seed)
         self.events = self._build()
 
     def _build(self) -> list[BatteryEvent]:
@@ -72,9 +105,10 @@ class StressBattery:
         v = class_speed(self.weight_class)
         e_strike = class_strike_energy(self.weight_class)
         drop_z = max(H * 0.85, 0.2)
+        n = self.n_trials
         events: list[BatteryEvent] = []
 
-        # --- drops at several orientations ---
+        # --- drops: three named orientations + n seeded random ones ---
         orientations = {
             "flat": np.array([1.0, 0, 0, 0]),
             "tilted": np.array([0.92, 0.38, 0, 0]),       # ~45 deg about X
@@ -86,31 +120,57 @@ class StressBattery:
                 init_pos=np.array([0.0, 0.0, drop_z]),
                 init_quat=quat / np.linalg.norm(quat),
             ))
-
-        # --- wall slams at several incidence angles ---
-        for ang_deg in (0, 30, 60):
-            a = np.radians(ang_deg)
-            vel = np.array([np.cos(a), np.sin(a), 0.0]) * v
+        for k, quat in enumerate(_random_quats(self.rng, n)):
             events.append(BatteryEvent(
-                name=f"wall_slam_{ang_deg}deg", duration=0.9,
-                init_pos=np.array([-L * 0.3, 0.0, H * 0.4]),
-                init_linvel=vel,
+                name=f"drop_rand{k}", duration=1.0,
+                init_pos=np.array([0.0, 0.0, drop_z]), init_quat=quat,
             ))
 
-        # --- tumble across the cage ---
+        # --- wall slams: incidence-angle sweep fired toward walls all around ---
+        # Capped at 50 deg: a steeper angle puts most of the launch speed into the
+        # vertical and fires the bot at the ceiling rather than the wall.
+        n_wall = 3 + n
+        incidences = np.linspace(0.0, 50.0, n_wall)
+        for k, ang_deg in enumerate(incidences):
+            a = np.radians(ang_deg)
+            az = 2.0 * np.pi * k / n_wall            # which wall to strike
+            dir_h = np.array([np.cos(az), np.sin(az), 0.0])
+            vel = (np.cos(a) * dir_h + np.sin(a) * np.array([0, 0, 1.0])) * v
+            start = np.array([-0.25 * L * np.cos(az), -0.25 * W * np.sin(az), H * 0.4])
+            events.append(BatteryEvent(
+                name=f"wall_slam_{int(round(ang_deg))}deg_az{int(round(np.degrees(az)))}",
+                duration=0.9, init_pos=start, init_linvel=vel,
+            ))
+
+        # --- tumbles: one scripted + n seeded random spins ---
         events.append(BatteryEvent(
             name="tumble", duration=1.8,
             init_pos=np.array([-L * 0.25, -W * 0.2, H * 0.5]),
             init_linvel=np.array([v * 0.7, v * 0.4, 0.0]),
             init_angvel=np.array([8.0, 12.0, 5.0]),
         ))
+        for k in range(n):
+            lin = self.rng.uniform(-1.0, 1.0, 3) * v * 0.6
+            lin[2] = abs(lin[2]) * 0.3              # mostly horizontal launch
+            events.append(BatteryEvent(
+                name=f"tumble_rand{k}", duration=1.5,
+                init_pos=np.array([0.0, 0.0, H * 0.5]),
+                init_linvel=lin, init_angvel=self.rng.uniform(-15.0, 15.0, 3),
+            ))
 
-        # --- opponent weapon strikes from two directions ---
+        # --- opponent weapon strikes: two fixed + n seeded random directions ---
         for name, d in (("side", np.array([-1.0, 0, 0])), ("top", np.array([0, 0, -1.0]))):
             events.append(BatteryEvent(
                 name=f"opponent_{name}", duration=1.0,
                 init_pos=np.array([0.0, 0.0, H * 0.25]),
                 strike=Strike(t_start=0.15, t_end=0.16, direction=d, energy_j=e_strike),
+            ))
+        for k in range(n):
+            events.append(BatteryEvent(
+                name=f"opponent_rand{k}", duration=1.0,
+                init_pos=np.array([0.0, 0.0, H * 0.25]),
+                strike=Strike(t_start=0.15, t_end=0.16,
+                              direction=_random_unit(self.rng), energy_j=e_strike),
             ))
         return events
 
@@ -133,6 +193,40 @@ def _nearest_part(bot: BotModel, world_point: np.ndarray, pos, quat) -> int:
     return best
 
 
+def _contain(engine: SimEngine, lo, hi, bmin, bmax,
+             restitution: float = CONTAIN_RESTITUTION) -> None:
+    """Pull the bot back inside the cage if its AABB has crossed an interior wall.
+
+    A guaranteed safety net against high-speed tunneling through the thin cage
+    walls. The outward linear-velocity component is reflected (a gentle bounce)
+    so the replay shows the bot ricocheting rather than escaping. Anchored on the
+    bot's geometry AABB (``pos + bounds``), never the body origin: for imported
+    CAD the body origin is not the geometry centre.
+    """
+    pos, quat = engine.get_pose()
+    lin, ang = engine.get_velocity()
+    changed = False
+    for ax in range(3):
+        if bmax[ax] - bmin[ax] >= hi[ax] - lo[ax]:
+            # Bot is larger than the cage on this axis: centre it and stop drift.
+            pos[ax] = 0.5 * (lo[ax] + hi[ax]) - 0.5 * (bmin[ax] + bmax[ax])
+            lin[ax] = 0.0
+            changed = True
+        elif pos[ax] + bmin[ax] < lo[ax]:
+            pos[ax] = lo[ax] - bmin[ax]
+            if lin[ax] < 0.0:
+                lin[ax] = -restitution * lin[ax]
+            changed = True
+        elif pos[ax] + bmax[ax] > hi[ax]:
+            pos[ax] = hi[ax] - bmax[ax]
+            if lin[ax] > 0.0:
+                lin[ax] = -restitution * lin[ax]
+            changed = True
+    if changed:
+        engine.set_velocity(lin, ang)
+        engine.set_pose(pos, quat)   # mj_forward refreshes contacts for read
+
+
 def run_battery(engine: SimEngine, battery: StressBattery, fps: int = 30) -> SimTrace:
     """Run every event, recording bot poses (for replay) and contacts (for damage)."""
     dt = engine.timestep
@@ -144,6 +238,15 @@ def run_battery(engine: SimEngine, battery: StressBattery, fps: int = 30) -> Sim
     half = (bot.original.bounds[1] - bot.original.bounds[0]) / 2.0
     center_local = bot.original.centroid
     mass = max(bot.total_mass(), 1e-6)
+    # Cap on the physical launch speed a weapon strike imparts (the damage map
+    # still sees the full energy; only the body push is limited).
+    dv_cap = STRIKE_DV_CAP_FACTOR * class_speed(battery.weight_class)
+
+    # Interior bounds + the bot's own AABB, for the containment safety net.
+    L, W, H = battery.arena.interior
+    lo = np.array([-L / 2.0, -W / 2.0, 0.0])
+    hi = np.array([L / 2.0, W / 2.0, H])
+    bmin, bmax = bot.original.bounds[0], bot.original.bounds[1]
 
     t_global = 0.0
     for ev in battery.events:
@@ -165,14 +268,15 @@ def run_battery(engine: SimEngine, battery: StressBattery, fps: int = 30) -> Sim
                 strike = ev.strike
                 window = max(strike.t_end - strike.t_start, dt)
                 dv = np.sqrt(2.0 * strike.energy_j / mass)
-                force_mag = mass * dv / window
+                force_mag = mass * dv / window          # reported impact severity
+                force_phys = mass * min(dv, dv_cap) / window   # capped body push
                 # Land on the face whose outward normal opposes the strike dir.
                 axis = int(np.argmax(np.abs(strike.direction)))
                 offset = np.zeros(3)
                 offset[axis] = -np.sign(strike.direction[axis]) * half[axis]
                 local_point = center_local + offset
                 world_point = R @ local_point + pos
-                engine.apply_impulse(strike.direction * force_mag, world_point)
+                engine.apply_impulse(strike.direction * force_phys, world_point)
                 trace.contacts.append(ContactEvent(
                     time=t_global + t_local, event=ev.name,
                     pos=world_point, local_pos=local_point, normal=-strike.direction,
@@ -183,6 +287,7 @@ def run_battery(engine: SimEngine, battery: StressBattery, fps: int = 30) -> Sim
                 ))
 
             engine.step()
+            _contain(engine, lo, hi, bmin, bmax)
 
             for c in engine.read_contacts():
                 local_pos = R.T @ (c["pos"] - pos)

@@ -66,12 +66,16 @@ def build_mjcf(
         geom_name = f"bot_part_{p.index}"
         geom_map[geom_name] = p.index
         cat = p.material.category if p.material else "metal"
-        fric, _bounce = _CONTACT.get(cat, _CONTACT["metal"])
+        fric, bounce = _CONTACT.get(cat, _CONTACT["metal"])
         density = p.material.density if p.material else 1000.0
+        # Realistic restitution: a softer damping ratio bounces more. Map the
+        # material's bounce (0..1) onto solref's damping ratio so metal, plastic
+        # and composite return impact energy differently.
+        dampratio = max(0.2, 1.0 - 0.7 * bounce)
         geom_lines.append(
             f'      <geom name="{geom_name}" type="mesh" mesh="{mesh_name}" '
             f'friction="{fric} 0.02 0.001" density="{density:.3f}" '
-            f'rgba="0.6 0.65 0.7 1" condim="3"/>'
+            f'rgba="0.6 0.65 0.7 1" condim="3" solref="0.02 {dampratio:.3f}"/>'
         )
 
     # --- inertial element -------------------------------------------------
@@ -99,7 +103,11 @@ def build_mjcf(
 
     xml = f"""<mujoco model="battlebot">
 {compiler}
-  <option timestep="{timestep}" gravity="0 0 -9.81" integrator="implicitfast"/>
+  <option timestep="{timestep}" gravity="0 0 -9.81" integrator="implicitfast"
+          solver="Newton" iterations="50" tolerance="1e-10"
+          cone="elliptic" impratio="2">
+    <flag multiccd="enable"/>
+  </option>
   <asset>
 {chr(10).join(asset_lines)}
   </asset>

@@ -15,11 +15,8 @@ from pathlib import Path
 
 def _sample_bot_path() -> Path:
     """Locate the bundled sample STL in both dev and frozen (.exe) runs."""
-    if getattr(sys, "frozen", False):
-        base = Path(getattr(sys, "_MEIPASS"))
-    else:
-        base = Path(__file__).resolve().parents[1]
-    return base / "data" / "sample_bots" / "wedge_bot.stl"
+    from battlebot_sim.mesh.segment import sample_bot_path
+    return Path(sample_bot_path())
 
 
 def _run_selftest() -> int:

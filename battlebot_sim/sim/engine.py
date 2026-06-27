@@ -63,6 +63,12 @@ class SimEngine:
         self.data.qvel[v:v + 3] = np.asarray(linear, dtype=float)
         self.data.qvel[v + 3:v + 6] = np.asarray(angular, dtype=float)
 
+    def get_velocity(self):
+        """Return the bot freejoint (linear, angular) velocity as numpy arrays."""
+        v = self._vadr
+        return (np.array(self.data.qvel[v:v + 3]),
+                np.array(self.data.qvel[v + 3:v + 6]))
+
     def apply_impulse(self, force, point) -> None:
         """Apply an external force (N) at a world point for the next step.
 

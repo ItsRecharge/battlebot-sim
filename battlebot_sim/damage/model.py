@@ -32,6 +32,12 @@ from battlebot_sim.sim.recorder import SimTrace
 POISSON = 0.3
 _OPPONENT_MODULUS_PA = 200e9   # treat the opponent weapon as steel
 
+# Spatial spread of each contact onto the mesh. Kept tight so the heatmap shows
+# crisp, localized hotspots (smaller sections of the bot) rather than a smear:
+# energy spreads over ~1.2% of the bot diagonal, stress over 40% of that.
+ENERGY_FALLOFF_FRAC = 0.012
+STRESS_RADIUS_FRAC = 0.4
+
 
 @dataclass
 class DamageResult:
@@ -97,11 +103,11 @@ def compute_damage(
         part_yield[p.index] = mat.yield_pa if mat else np.inf
         part_modulus[p.index] = mat.youngs_pa if mat else 1.0
 
-    # Falloff radius for energy spreading: a fraction of the bot's size.
+    # Falloff radius for energy spreading: a small fraction of the bot's size.
     if energy_falloff is None:
         diag = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
-        energy_falloff = max(diag * 0.04, 5e-3)
-    stress_radius = energy_falloff * 0.5
+        energy_falloff = max(diag * ENERGY_FALLOFF_FRAC, 5e-3)
+    stress_radius = energy_falloff * STRESS_RADIUS_FRAC
 
     energy = np.zeros(n_faces)
     peak_stress = np.zeros(n_faces)
