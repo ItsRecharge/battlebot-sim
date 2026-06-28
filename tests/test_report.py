@@ -35,7 +35,14 @@ def test_full_pipeline_and_report(tmp_path):
         assert os.path.exists(paths[key]), f"missing {key}"
         assert os.path.getsize(paths[key]) > 0
 
+    # The heatmaps are real rendered images, not empty stubs.
+    assert os.path.getsize(paths["energy_png"]) > 1000
+    assert os.path.getsize(paths["failure_png"]) > 1000
+
     report_text = open(paths["report"], encoding="utf-8").read()
     assert "BattleBot Damage Report" in report_text
     assert "Per-part damage" in report_text
     assert "Worst impacts" in report_text
+    # The report must reach an explicit pass/fail verdict.
+    assert "## Verdict" in report_text
+    assert ("predicted to yield" in report_text) or ("No part exceeded" in report_text)

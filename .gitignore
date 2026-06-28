@@ -28,3 +28,4 @@ battlebot_sim.build/
 out/
 *.png
 !data/**/*.png
+test_stl/

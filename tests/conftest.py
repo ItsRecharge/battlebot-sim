@@ -1,6 +1,5 @@
 """Shared test fixtures: synthetic bots built in SI metres."""
 
-import numpy as np
 import pytest
 import trimesh
 
@@ -21,6 +20,18 @@ def aluminum(library):
 def alu_cube_10cm():
     """A solid 10 cm aluminium cube, centred at the origin (in metres)."""
     return trimesh.creation.box(extents=(0.1, 0.1, 0.1))
+
+
+@pytest.fixture(scope="session")
+def selftest_result():
+    """The finalized ``(trace, result)`` from the seeded offline pipeline.
+
+    Session-scoped so the heavy battery runs once; reused by the golden-baseline
+    regression oracle and the fidelity-validation suite.
+    """
+    from helpers import run_selftest_pipeline
+
+    return run_selftest_pipeline()
 
 
 @pytest.fixture

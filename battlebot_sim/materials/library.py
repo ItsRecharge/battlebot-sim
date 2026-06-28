@@ -22,7 +22,7 @@ def _data_dir() -> Path:
     """Locate the bundled data/ directory in both dev and frozen (.exe) runs."""
     if getattr(sys, "frozen", False):
         # PyInstaller unpacks bundled data under sys._MEIPASS.
-        return Path(getattr(sys, "_MEIPASS")) / "data"
+        return Path(sys._MEIPASS) / "data"
     return Path(__file__).resolve().parents[2] / "data"
 
 
@@ -57,7 +57,7 @@ class Material:
         return self.youngs_modulus * 1.0e9
 
     @classmethod
-    def from_dict(cls, d: dict) -> "Material":
+    def from_dict(cls, d: dict) -> Material:
         return cls(
             name=d["name"],
             density=float(d["density"]),
@@ -113,7 +113,7 @@ class MaterialLibrary:
         Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     @classmethod
-    def from_file(cls, path: str | Path) -> "MaterialLibrary":
+    def from_file(cls, path: str | Path) -> MaterialLibrary:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         return cls([Material.from_dict(d) for d in data["materials"]])
 

@@ -4,18 +4,18 @@ import numpy as np
 import trimesh
 
 from battlebot_sim.arena.nhrl import build_arena
+from battlebot_sim.damage.braces import apply_brace_sharing
+from battlebot_sim.damage.fields import normalize, vertex_scalars
+from battlebot_sim.damage.model import (
+    _effective_modulus,
+    _hertzian_peak_pressure,
+    compute_damage,
+)
 from battlebot_sim.materials.assign import NHRL_CLASSES
 from battlebot_sim.materials.library import load_default_library
 from battlebot_sim.mesh.segment import BotModel, segment_mesh
-from battlebot_sim.sim.engine import SimEngine
 from battlebot_sim.sim.battery import StressBattery, run_battery
-from battlebot_sim.damage.model import (
-    compute_damage,
-    _effective_modulus,
-    _hertzian_peak_pressure,
-)
-from battlebot_sim.damage.braces import apply_brace_sharing
-from battlebot_sim.damage.fields import normalize, vertex_scalars
+from battlebot_sim.sim.engine import SimEngine
 
 
 def _braced_bot(library, brace_thickness=0.02):
@@ -83,7 +83,6 @@ def test_compute_damage_populates_fields():
 
 def test_brace_relieves_stress_monotonically():
     library = load_default_library()
-    arena = build_arena(NHRL_CLASSES["3lb"])
 
     # Identical synthetic stress field on the braced parts; vary brace thickness.
     def braced_margin(thickness):
@@ -150,7 +149,6 @@ def test_brace_absorbs_transferred_load():
 
 def test_no_braces_is_noop():
     library = load_default_library()
-    arena = build_arena(NHRL_CLASSES["3lb"])
     bot = _braced_bot(library)
     for p in bot.parts:
         p.is_brace = False

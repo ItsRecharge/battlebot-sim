@@ -84,6 +84,7 @@ def test_parts_panel_recalc_button(app):
 
 def test_parts_panel_searchable_combo_and_guard(app):
     from PySide6 import QtCore
+
     from battlebot_sim.materials.library import load_default_library
     from battlebot_sim.mesh.segment import load_bot
     from battlebot_sim.ui.panels import PartsPanel
@@ -208,6 +209,7 @@ def test_stream_worker_streams_and_finishes(app):
     """Drive StreamWorker synchronously (no QThread) at huge speed so pacing
     sleeps collapse: it must stream chunks and emit a finished trace+result."""
     import numpy as np
+
     from battlebot_sim.arena.nhrl import build_arena
     from battlebot_sim.materials.assign import NHRL_CLASSES
     from battlebot_sim.materials.library import load_default_library
@@ -241,7 +243,7 @@ def test_live_charts_rolling_window(app):
 
     charts = LiveCharts()
     charts.reset()
-    for i in range(WINDOW_OVERFLOW := 700):
+    for i in range(700):  # overflow the rolling window to exercise eviction
         charts.append(MetricSample(
             t=i * 0.1, peak_force=float(i), cum_energy=float(i) * 2,
             max_margin=min(1.4, i / 500.0), speed=i * 0.01, hit_rate=float(i)))
@@ -329,7 +331,7 @@ def test_stream_worker_cancel_before_start(app):
     bot.assign_material_to_all(lib.get("Aluminum 6061-T6"))
 
     worker = StreamWorker(bot, arena, wc, lib, n_trials=1, fps=30, speed=1000.0)
-    worker._cancel = True                         # cancel before run() even starts
+    worker.cancel()                               # cancel before run() even starts
     done, failed = {}, []
     worker.finished.connect(lambda t, r: done.update(trace=t))
     worker.failed.connect(failed.append)
@@ -338,3 +340,42 @@ def test_stream_worker_cancel_before_start(app):
     assert not failed                             # no spurious error dialog
     assert "trace" in done
     assert done["trace"].total_contacts() == 0
+
+
+def test_stream_worker_cancel_from_another_thread(app):
+    """Cancelling from a *different* thread mid-run must finalise a partial trace
+    without hanging or failing — the cross-thread cancel uses a threading.Event."""
+    import threading
+    import time as _time
+
+    from PySide6 import QtCore
+
+    from battlebot_sim.arena.nhrl import build_arena
+    from battlebot_sim.materials.assign import NHRL_CLASSES
+    from battlebot_sim.materials.library import load_default_library
+    from battlebot_sim.mesh.segment import load_bot
+    from battlebot_sim.ui.main_window import StreamWorker
+
+    lib = load_default_library()
+    wc = NHRL_CLASSES["3lb"]
+    arena = build_arena(wc)
+    bot = load_bot(os.path.abspath(SAMPLE), 1.0)
+    bot.assign_material_to_all(lib.get("Aluminum 6061-T6"))
+
+    worker = StreamWorker(bot, arena, wc, lib, n_trials=1, fps=30, speed=1.0)
+    done, failed = {}, []
+    # Direct connections so the signals fire synchronously in the worker thread
+    # (there is no Qt event loop here to deliver queued cross-thread signals).
+    direct = QtCore.Qt.ConnectionType.DirectConnection
+    worker.finished.connect(lambda t, r: done.update(trace=t), direct)
+    worker.failed.connect(failed.append, direct)
+
+    runner = threading.Thread(target=worker.run)
+    runner.start()
+    _time.sleep(0.1)                # let the run loop get going
+    worker.cancel()                 # cancel from the main thread, mid-run
+    runner.join(timeout=30)
+
+    assert not runner.is_alive()    # finalised and returned; did not hang
+    assert not failed               # cancellation is not a failure
+    assert "trace" in done          # a (partial) trace was still emitted

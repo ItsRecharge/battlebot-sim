@@ -1,0 +1,30 @@
+# Pre-commit hooks for BattleBot Sim. Install once with:
+#   pip install pre-commit && pre-commit install
+# Run on all files:
+#   pre-commit run --all-files
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff            # lint (with --fix)
+        args: [--fix]
+      - id: ruff-format     # format
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+
+  # mypy is slow; run it manually (pre-commit run --hook-stage manual mypy)
+  # rather than on every commit.
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.11.2
+    hooks:
+      - id: mypy
+        stages: [manual]
+        additional_dependencies: []
+        args: [--ignore-missing-imports]

@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Lint & type-check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: Ruff lint
+        run: ruff check .
+      # Formatting is being migrated to ruff-format incrementally (pre-commit
+      # formats touched files); it is not yet a hard gate across the legacy tree.
+      - name: mypy
+        run: mypy battlebot_sim
+
+  test-windows:
+    name: Tests (Windows, py${{ matrix.python }})
+    runs-on: windows-latest          # primary target platform
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12"]
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: Tests (one process per file — dodges the native DLL crash)
+        run: pwsh ./scripts/run_isolated_tests.ps1
+
+  test-ubuntu:
+    name: Tests (Ubuntu, informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true          # no GL / can't reproduce the native crash here
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: Pure-logic tests with coverage
+        run: >
+          xvfb-run -a python -m pytest
+          tests/test_config.py tests/test_validation.py tests/test_damage.py
+          tests/test_mesh.py tests/test_materials.py tests/test_logging_setup.py
+          tests/test_golden_selftest.py
+          --cov=battlebot_sim --cov-report=term-missing

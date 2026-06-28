@@ -6,6 +6,18 @@ build-backend = "setuptools.build_meta"
 name = "battlebot-sim"
 version = "0.1.1"
 description = "Impact-damage simulator for combat robots: assign materials to an STL, run an NHRL stress battery, and view damage heatmaps."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Neel Bansal", email = "neel.m.bansal@gmail.com" }]
+keywords = ["battlebot", "combat-robotics", "simulation", "mujoco", "damage", "nhrl"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Manufacturing",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Physics",
+]
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "numpy>=1.26,<2",  # pinned <2: numpy 2.x ABI caused intermittent native crashes during PyInstaller analysis
@@ -23,10 +35,20 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.5",
+    "mypy>=1.8",
+    "pre-commit>=3.5",
+    "tomli>=2.0; python_version < '3.11'",  # config TOML overlay on Python 3.10
 ]
 
 [project.scripts]
 battlebot-sim = "battlebot_sim.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/ItsRecharge/battlebot-sim"
+Repository = "https://github.com/ItsRecharge/battlebot-sim"
+Issues = "https://github.com/ItsRecharge/battlebot-sim/issues"
 
 [tool.setuptools.packages.find]
 include = ["battlebot_sim*"]
@@ -36,3 +58,44 @@ battlebot_sim = ["../data/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "native_isolated: loads heavy native libs (mujoco+vtk+pillow); safest run in its own process (see CONTRIBUTING.md)",
+    "validation: physics-fidelity validation case (analytic ground truth / convergence)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# E501 (line length) is noisy on the formatted MJCF/XML f-strings; B008 fires on
+# our deliberate "defaulted dataclass argument" config pattern (DEFAULT_CONFIG.*).
+ignore = ["E501", "B008"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true   # mujoco / pyvista / trimesh / PySide6 ship no stubs
+follow_imports = "silent"       # don't report errors in not-yet-gated dependencies
+files = ["battlebot_sim"]
+# The GUI (Qt-heavy, verified on-display) and a few legacy modules carry
+# pre-existing type debt; exempt them for now and widen this gate over time.
+exclude = "battlebot_sim/(ui/|viz\\.py|mesh/segment\\.py|materials/library\\.py|sim/battery\\.py)"
+
+# Start strict only on the new, fully-typed pure-logic modules; widen over time.
+[[tool.mypy.overrides]]
+module = [
+    "battlebot_sim.config",
+    "battlebot_sim.validation",
+    "battlebot_sim.errors",
+    "battlebot_sim.logging_setup",
+]
+disallow_untyped_defs = true
+
+[tool.coverage.run]
+source = ["battlebot_sim"]
+omit = ["battlebot_sim/ui/viewport.py"]  # needs a live GL context; verified on-display, not in CI
+
+[tool.coverage.report]
+show_missing = true

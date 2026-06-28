@@ -15,9 +15,12 @@ import hashlib
 import numpy as np
 import pyvista as pv
 
-from battlebot_sim.damage.model import DamageResult
 from battlebot_sim.damage.fields import vertex_scalars
+from battlebot_sim.damage.model import DamageResult
+from battlebot_sim.logging_setup import get_logger
 from battlebot_sim.mesh.segment import BotModel
+
+logger = get_logger(__name__)
 
 FIELD_SPECS = {
     "energy": {"title": "Impact Energy (J, log)", "cmap": "inferno"},
@@ -182,10 +185,9 @@ def attach_field_smooth(
             sv, sf, svals = _subdivide_field(verts, faces, vert_vals, levels)
             if len(svals) != len(sv):          # defensive: shape mismatch -> bail
                 sv, sf, svals = verts, faces, vert_vals
-        except Exception as exc:               # fall back to the coarse mesh, but say so
-            import warnings
-            warnings.warn(f"heatmap subdivision failed ({exc}); "
-                          "rendering on the un-subdivided mesh.")
+        except Exception:                      # fall back to the coarse mesh, but say so
+            logger.warning("heatmap subdivision failed; rendering on the "
+                           "un-subdivided mesh.", exc_info=True)
             sv, sf, svals = verts, faces, vert_vals
 
     heat = pv.PolyData(sv, _faces_to_pv(sf))
@@ -229,7 +231,7 @@ def render_heatmap_png(
         plotter.enable_anti_aliasing("ssaa")
         plotter.enable_ssao(radius=0.05)
     except Exception:
-        pass
+        logger.debug("SSAA/SSAO unavailable for offscreen heatmap render", exc_info=True)
     plotter.add_axes(color="#1b2733")
     plotter.view_isometric()
     plotter.screenshot(path)

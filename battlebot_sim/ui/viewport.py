@@ -11,8 +11,11 @@ from vtkmodules.vtkRenderingCore import vtkCellPicker
 from battlebot_sim import viz
 from battlebot_sim.arena.nhrl import Arena
 from battlebot_sim.damage.model import DamageResult
+from battlebot_sim.logging_setup import get_logger
 from battlebot_sim.mesh.segment import BotModel
 from battlebot_sim.sim.recorder import SimTrace
+
+logger = get_logger(__name__)
 
 
 def _matrix(pos, quat) -> np.ndarray:
@@ -84,16 +87,16 @@ class BotViewport(QtInteractor):
         try:
             self.enable_anti_aliasing("ssaa")
         except Exception:
-            pass
+            logger.debug("SSAA anti-aliasing unavailable on this GL stack", exc_info=True)
         # Best-effort order-independent transparency for overlapping cage walls.
         try:
             self.enable_depth_peeling(number_of_peels=8, occlusion_ratio=0.0)
         except Exception:
-            pass
+            logger.debug("depth peeling unavailable on this GL stack", exc_info=True)
         try:
             self.enable_ssao(radius=0.05)
         except Exception:
-            pass
+            logger.debug("SSAO unavailable on this GL stack", exc_info=True)
         # Neutral three-point rig: warm key, cool fill, cool back/rim.
         rig = (
             dict(position=(6.0, -6.0, 8.0), color=(1.0, 0.97, 0.92), intensity=0.95),
@@ -155,7 +158,7 @@ class BotViewport(QtInteractor):
             for title in list(self.scalar_bars.keys()):
                 self.remove_scalar_bar(title, render=False)
         except Exception:
-            pass
+            logger.debug("failed to clear scalar bars", exc_info=True)
 
     # ---- scene setup -----------------------------------------------------
     def set_bot(self, bot: BotModel) -> None:
@@ -273,7 +276,7 @@ class BotViewport(QtInteractor):
             try:
                 self.remove_actor("event_label", render=False)
             except Exception:
-                pass
+                logger.debug("failed to clear event label actor", exc_info=True)
             return
         self.add_text(text, position="upper_left", font_size=12,
                       color="#1b2733", name="event_label")
@@ -370,7 +373,7 @@ class BotOnlyView(QtInteractor):
         try:
             self.enable_anti_aliasing("ssaa")
         except Exception:
-            pass
+            logger.debug("SSAA anti-aliasing unavailable on this GL stack", exc_info=True)
         self._spin = QtCore.QTimer(self)
         self._spin.setInterval(33)      # ~30 Hz turntable
         self._spin.timeout.connect(self._turntable)
@@ -391,7 +394,7 @@ class BotOnlyView(QtInteractor):
             for title in list(self.scalar_bars.keys()):
                 self.remove_scalar_bar(title, render=False)
         except Exception:
-            pass
+            logger.debug("failed to clear scalar bars", exc_info=True)
 
     def _show_solid(self) -> None:
         if self.bot is None or self.poly is None:
@@ -461,4 +464,4 @@ class BotOnlyView(QtInteractor):
             self.camera.Azimuth(0.6)        # vtkCamera method (degrees)
             self.render()
         except Exception:
-            pass
+            logger.debug("turntable spin step failed", exc_info=True)

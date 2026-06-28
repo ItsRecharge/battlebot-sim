@@ -20,11 +20,15 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from battlebot_sim.arena.nhrl import Arena
+from battlebot_sim.config import DEFAULT_CONFIG
 from battlebot_sim.materials.assign import WeightClass
 from battlebot_sim.mesh.segment import BotModel
 from battlebot_sim.sim.engine import SimEngine
 from battlebot_sim.sim.recorder import (
-    ContactEvent, FrameSample, SimTrace, StreamChunk,
+    ContactEvent,
+    FrameSample,
+    SimTrace,
+    StreamChunk,
 )
 
 
@@ -51,23 +55,25 @@ class BatteryEvent:
     strike: Strike | None = None
 
 
-# An opponent strike delivers its full energy to the *damage* model, but the
-# *physical* launch is capped to a multiple of the class speed so the bot bounces
-# around the cage instead of being fired clean through a wall (see run_battery).
-STRIKE_DV_CAP_FACTOR = 1.5
-# Restitution applied when the containment safety-net reflects the bot off an
-# interior wall: a gentle bounce reads more naturally than a dead stop.
-CONTAIN_RESTITUTION = 0.3
+# Strike/containment tuning + class scaling tables live on ``BatteryConfig``
+# (battlebot_sim/config.py). An opponent strike delivers its full energy to the
+# *damage* model, but the *physical* launch is capped to a multiple of class speed
+# so the bot bounces around the cage instead of being fired clean through a wall
+# (see run_battery). The containment net reflects the bot off interior walls with
+# a gentle restitution rather than a dead stop.
+STRIKE_DV_CAP_FACTOR = DEFAULT_CONFIG.battery.strike_dv_cap_factor
+CONTAIN_RESTITUTION = DEFAULT_CONFIG.battery.contain_restitution
 
 
 def class_speed(wc: WeightClass) -> float:
     """Representative collision speed (m/s) for a class."""
-    return {"3lb": 6.0, "12lb": 8.0, "30lb": 10.0}.get(wc.key, 7.0)
+    cfg = DEFAULT_CONFIG.battery
+    return cfg.class_speed.get(wc.key, cfg.default_class_speed)
 
 
 def class_strike_energy(wc: WeightClass) -> float:
     """Representative opponent-weapon energy (J): ~200 J per kg of class limit."""
-    return 200.0 * wc.max_mass_kg
+    return DEFAULT_CONFIG.battery.strike_energy_per_kg * wc.max_mass_kg
 
 
 def _random_unit(rng: np.random.Generator) -> np.ndarray:

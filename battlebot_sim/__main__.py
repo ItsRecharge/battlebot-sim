@@ -1,7 +1,9 @@
 """Entry point: launch the BattleBot Damage Simulator desktop app.
 
-    python -m battlebot_sim              # normal GUI
-    python -m battlebot_sim --selftest   # construct UI, load bundled sample, exit
+    python -m battlebot_sim                         # normal GUI
+    python -m battlebot_sim --selftest              # headless smoke test, exit
+    python -m battlebot_sim --log-level DEBUG        # verbose engineering log
+    python -m battlebot_sim --log-file run.log       # also tee logs to a file
 
 --selftest is used to smoke-test the packaged .exe: it verifies imports, the Qt
 window, the VTK viewport, and bundled-data resolution all work, then quits.
@@ -45,14 +47,14 @@ def _run_selftest() -> int:
         if not sample.exists():
             return 2
 
+        from battlebot_sim import viz
+        from battlebot_sim.arena.nhrl import build_arena
+        from battlebot_sim.damage.model import compute_damage
+        from battlebot_sim.materials.assign import NHRL_CLASSES
         from battlebot_sim.materials.library import load_default_library
         from battlebot_sim.mesh.segment import load_bot
-        from battlebot_sim.arena.nhrl import build_arena
-        from battlebot_sim.materials.assign import NHRL_CLASSES
-        from battlebot_sim.sim.engine import SimEngine
-        from battlebot_sim import viz
-        from battlebot_sim.damage.model import compute_damage
         from battlebot_sim.sim.battery import StressBattery, run_battery
+        from battlebot_sim.sim.engine import SimEngine
 
         library = load_default_library()
         bot = load_bot(str(sample), scale_to_m=1.0)
@@ -79,11 +81,29 @@ def _run_selftest() -> int:
         return 1
 
 
+def _parse_log_args(argv: list[str]) -> tuple[str, str | None]:
+    """Pull --log-level / --log-file out of argv without disturbing Qt's args."""
+    def _opt(flag: str, default):
+        if flag in argv and argv.index(flag) + 1 < len(argv):
+            return argv[argv.index(flag) + 1]
+        return default
+
+    return _opt("--log-level", "INFO"), _opt("--log-file", None)
+
+
 def main() -> int:
+    from battlebot_sim._bootstrap import preload_native_libraries
+    from battlebot_sim.logging_setup import configure_logging
+
+    preload_native_libraries()      # pin native-lib load order before anything else
+    level, logfile = _parse_log_args(sys.argv)
+    configure_logging(level=level, logfile=logfile)
+
     if "--selftest" in sys.argv:
         return _run_selftest()
 
     from PySide6 import QtWidgets
+
     from battlebot_sim.ui.main_window import MainWindow
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)

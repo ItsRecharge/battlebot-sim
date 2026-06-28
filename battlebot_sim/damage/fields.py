@@ -12,6 +12,8 @@ def normalize(values: np.ndarray, mode: str = "linear") -> np.ndarray:
     which spans orders of magnitude).
     """
     v = np.asarray(values, dtype=float)
+    if v.size == 0:
+        return v                       # nothing to scale; avoid min() on empty
     if mode == "log":
         v = np.log1p(np.clip(v, 0.0, None))
     vmin, vmax = float(v.min()), float(v.max())

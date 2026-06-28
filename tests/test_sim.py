@@ -6,10 +6,12 @@ import trimesh
 from battlebot_sim.arena.nhrl import build_arena
 from battlebot_sim.materials.assign import NHRL_CLASSES
 from battlebot_sim.mesh.segment import BotModel, segment_mesh
-from battlebot_sim.sim.engine import SimEngine
 from battlebot_sim.sim.battery import (
-    StressBattery, run_battery, class_strike_energy,
+    StressBattery,
+    class_strike_energy,
+    run_battery,
 )
+from battlebot_sim.sim.engine import SimEngine
 
 
 def _make_bot(aluminum, offset=(0.0, 0.0, 0.0)):
@@ -178,7 +180,7 @@ def test_iter_battery_emits_every_contact_exactly_once(aluminum):
     assert len(trace.frames) > 0
     assert len(streamed) == len(trace.contacts)
     # Identity, not equality: the chunk holds the very objects in the trace.
-    assert all(a is b for a, b in zip(streamed, trace.contacts))
+    assert all(a is b for a, b in zip(streamed, trace.contacts, strict=True))
 
 
 def test_iter_battery_trace_matches_run_battery(aluminum):

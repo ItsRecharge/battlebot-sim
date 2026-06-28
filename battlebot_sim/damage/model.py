@@ -25,27 +25,18 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 from battlebot_sim.arena.nhrl import Arena
-from battlebot_sim.materials.library import Material, MaterialLibrary
+from battlebot_sim.config import DEFAULT_CONFIG, DamageConfig
+from battlebot_sim.materials.library import MaterialLibrary
 from battlebot_sim.mesh.segment import BotModel
 from battlebot_sim.sim.recorder import SimTrace
 
-POISSON = 0.3
-_OPPONENT_MODULUS_PA = 200e9   # treat the opponent weapon as steel
-
-# Spatial spread of each contact onto the mesh. Each impact paints a smooth
-# exponential (Gaussian) hotspot whose sigma is tied to the Hertzian contact-
-# patch radius `a`, with a visibility FLOOR (a fraction of the bot diagonal, plus
-# an absolute minimum) so even a sharp hit reads as a gradient blob instead of a
-# single triangle, and a CAP (a fraction of the struck part) so a tiny part is
-# not swamped. Stress blobs are tighter than energy blobs (damage localises more
-# than absorbed energy). These drive the *appearance*; the peak values (and so
-# the failure verdict) come from the unchanged Hertzian model below.
-SIGMA_PATCH_FACTOR = 8.0      # energy sigma ~ this * Hertzian patch radius a
-SIGMA_MIN_FRAC = 0.025        # floor: sigma >= this * bot diagonal …
-SIGMA_ABS_MIN = 3.0e-3        # … but never below this many metres
-SIGMA_PART_FRAC = 0.5         # cap:  sigma <= this * struck part's max extent
-STRESS_SIGMA_FRAC = 0.4       # stress sigma = this * energy sigma (tighter)
-KERNEL_RADIUS_SIGMAS = 3.0    # gather faces within this many sigma of the hit
+# The Hertzian-contact and heatmap-spread tuning constants live on ``DamageConfig``
+# (battlebot_sim/config.py). Each impact paints a smooth exponential hotspot whose
+# sigma is tied to the Hertzian contact-patch radius, floored for visibility (a
+# fraction of the bot diagonal, plus an absolute minimum) and capped per struck
+# part. These drive the *appearance*; the peak values — and so the failure verdict
+# — come from the unchanged Hertzian model below. ``cfg`` is threaded in as a
+# defaulted argument so a study can vary one constant per run.
 
 # Legacy fixed-spread fractions, used only when an explicit ``energy_falloff`` is
 # passed (overrides the per-contact sigma).
@@ -68,8 +59,9 @@ class DamageResult:
         return [i for i, m in self.part_max_margin.items() if m >= threshold]
 
 
-def _effective_modulus(bot_E: float, other_E: float) -> float:
-    inv = (1 - POISSON**2) / max(bot_E, 1.0) + (1 - POISSON**2) / max(other_E, 1.0)
+def _effective_modulus(bot_E: float, other_E: float,
+                       poisson: float = DEFAULT_CONFIG.damage.poisson) -> float:
+    inv = (1 - poisson**2) / max(bot_E, 1.0) + (1 - poisson**2) / max(other_E, 1.0)
     return 1.0 / inv
 
 
@@ -90,13 +82,16 @@ def _hertzian_patch_radius(force: float, eff_modulus: float, radius: float) -> f
     return (3.0 * max(force, 0.0) * radius / (4.0 * max(eff_modulus, 1.0))) ** (1.0 / 3.0)
 
 
-def _other_modulus(other: str, arena: Arena, library: MaterialLibrary) -> float:
+def _other_modulus(
+    other: str, arena: Arena, library: MaterialLibrary,
+    opponent_modulus_pa: float = DEFAULT_CONFIG.damage.opponent_modulus_pa,
+) -> float:
     if other == "opponent_weapon":
-        return _OPPONENT_MODULUS_PA
+        return opponent_modulus_pa
     try:
         return library.get(arena.material_of(other)).youngs_pa
     except KeyError:
-        return _OPPONENT_MODULUS_PA
+        return opponent_modulus_pa
 
 
 class DamageAccumulator:
@@ -116,10 +111,12 @@ class DamageAccumulator:
         arena: Arena,
         library: MaterialLibrary,
         energy_falloff: float | None = None,
+        cfg: DamageConfig = DEFAULT_CONFIG.damage,
     ):
         self.bot = bot
         self.arena = arena
         self.library = library
+        self.cfg = cfg
 
         mesh = bot.original
         self.mesh = mesh
@@ -147,7 +144,7 @@ class DamageAccumulator:
         # from its Hertzian patch radius, floored for visibility (see ingest).
         self.diag = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
         self._fixed_sigma = energy_falloff
-        self.sigma_floor = max(SIGMA_MIN_FRAC * self.diag, SIGMA_ABS_MIN)
+        self.sigma_floor = max(cfg.sigma_min_frac * self.diag, cfg.sigma_abs_min)
 
         self.energy = np.zeros(self.n_faces)
         self.peak_stress = np.zeros(self.n_faces)
@@ -163,11 +160,12 @@ class DamageAccumulator:
         and capped at half the struck part's size."""
         if self._fixed_sigma is not None:
             return float(self._fixed_sigma)
+        cfg = self.cfg
         a = _hertzian_patch_radius(force, eff_E, self.part_radius[pidx])
-        sigma = SIGMA_PATCH_FACTOR * a
+        sigma = cfg.sigma_patch_factor * a
         sigma = max(sigma, self.sigma_floor)
-        sigma = min(sigma, SIGMA_PART_FRAC * self.part_char_len[pidx])
-        return max(sigma, SIGMA_ABS_MIN)
+        sigma = min(sigma, cfg.sigma_part_frac * self.part_char_len[pidx])
+        return max(sigma, cfg.sigma_abs_min)
 
     def ingest(self, contacts, dt: float) -> None:
         """Fold a batch of contacts into the running energy/stress fields.
@@ -183,17 +181,19 @@ class DamageAccumulator:
             force = abs(c.normal_force)
             eff_E = _effective_modulus(
                 self.part_modulus[pidx],
-                _other_modulus(c.other, self.arena, self.library),
+                _other_modulus(c.other, self.arena, self.library,
+                               self.cfg.opponent_modulus_pa),
+                self.cfg.poisson,
             )
             p0 = _hertzian_peak_pressure(force, eff_E, self.part_radius[pidx])
             sigma_e = self._contact_sigma(force, eff_E, pidx)
-            sigma_s = STRESS_SIGMA_FRAC * sigma_e
+            sigma_s = self.cfg.stress_sigma_frac * sigma_e
 
             # --- energy: conserved Gaussian spread over nearby faces ---
             work = force * max(c.rel_speed, 0.0) * dt
             if work > 0:
                 idx = self.tree.query_ball_point(
-                    c.local_pos, KERNEL_RADIUS_SIGMAS * sigma_e)
+                    c.local_pos, self.cfg.kernel_radius_sigmas * sigma_e)
                 if not idx:
                     idx = [int(self.tree.query(c.local_pos)[1])]
                 d = np.linalg.norm(self.centroids[idx] - c.local_pos, axis=1)
@@ -204,7 +204,7 @@ class DamageAccumulator:
 
             # --- failure margin: Gaussian-weighted Hertzian peak, MAX-combined ---
             sidx = self.tree.query_ball_point(
-                c.local_pos, KERNEL_RADIUS_SIGMAS * sigma_s)
+                c.local_pos, self.cfg.kernel_radius_sigmas * sigma_s)
             if not sidx:
                 sidx = [int(self.tree.query(c.local_pos)[1])]
             ds = np.linalg.norm(self.centroids[sidx] - c.local_pos, axis=1)
@@ -254,12 +254,13 @@ def compute_damage(
     arena: Arena,
     library: MaterialLibrary,
     energy_falloff: float | None = None,
+    cfg: DamageConfig = DEFAULT_CONFIG.damage,
 ) -> DamageResult:
     """Build energy + failure-margin fields from a complete battery trace.
 
     A thin wrapper over DamageAccumulator so the offline report/selftest path and
     the live streaming path share one implementation.
     """
-    acc = DamageAccumulator(bot, arena, library, energy_falloff)
+    acc = DamageAccumulator(bot, arena, library, energy_falloff, cfg=cfg)
     acc.ingest(trace.contacts, trace.dt)
     return acc.finalize()

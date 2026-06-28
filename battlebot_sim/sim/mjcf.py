@@ -15,15 +15,16 @@ from __future__ import annotations
 import numpy as np
 
 from battlebot_sim.arena.nhrl import Arena
+from battlebot_sim.config import DEFAULT_CONFIG
+from battlebot_sim.logging_setup import get_logger
 from battlebot_sim.mesh.segment import BotModel
 
-# Per-material contact tuning: (sliding friction, restitution-ish bounce 0..1).
-# Restitution is emulated via solref; we keep it modest and material-flavoured.
-_CONTACT = {
-    "metal": (0.6, 0.2),
-    "plastic": (0.4, 0.1),
-    "composite": (0.5, 0.15),
-}
+logger = get_logger(__name__)
+
+# Per-material contact tuning (sliding friction, restitution-ish bounce 0..1) and
+# gravity now live on ``ContactConfig`` (battlebot_sim/config.py). Restitution is
+# emulated via solref; we keep it modest and material-flavoured.
+_CONTACT = DEFAULT_CONFIG.contact.material_friction_bounce
 
 
 def _fmt(values) -> str:
@@ -35,6 +36,8 @@ def _hull_vertices(part) -> np.ndarray:
     try:
         verts = np.asarray(part.mesh.convex_hull.vertices, dtype=float)
     except Exception:
+        logger.debug("convex hull failed for part %r; using raw vertices",
+                     getattr(part, "name", "?"), exc_info=True)
         verts = np.asarray(part.mesh.vertices, dtype=float)
     if len(verts) < 4:
         # Pad a near-degenerate part into a tiny tetra so MuJoCo accepts it.
@@ -48,7 +51,7 @@ def _hull_vertices(part) -> np.ndarray:
 def build_mjcf(
     arena: Arena,
     bot: BotModel,
-    timestep: float = 5e-4,
+    timestep: float = DEFAULT_CONFIG.sim.timestep,
     use_explicit_inertia: bool = True,
 ) -> tuple[str, dict[str, int]]:
     """Return (mjcf_xml, geom_name -> part_index map)."""
@@ -103,7 +106,7 @@ def build_mjcf(
 
     xml = f"""<mujoco model="battlebot">
 {compiler}
-  <option timestep="{timestep}" gravity="0 0 -9.81" integrator="implicitfast"
+  <option timestep="{timestep}" gravity="0 0 {DEFAULT_CONFIG.contact.gravity}" integrator="implicitfast"
           solver="Newton" iterations="50" tolerance="1e-10"
           cone="elliptic" impratio="2">
     <flag multiccd="enable"/>

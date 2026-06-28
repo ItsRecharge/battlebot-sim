@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 
 from PySide6 import QtCore, QtWidgets
@@ -10,6 +11,8 @@ from PySide6 import QtCore, QtWidgets
 from battlebot_sim.arena.nhrl import build_arena
 from battlebot_sim.damage.braces import apply_brace_sharing
 from battlebot_sim.damage.model import DamageAccumulator
+from battlebot_sim.errors import ValidationError
+from battlebot_sim.logging_setup import get_logger
 from battlebot_sim.materials.assign import NHRL_CLASSES, validate_weight_class
 from battlebot_sim.materials.library import load_default_library
 from battlebot_sim.mesh.segment import load_bot
@@ -21,6 +24,9 @@ from battlebot_sim.ui.charts import LiveCharts, MetricStreamer
 from battlebot_sim.ui.pacing import pace_schedule
 from battlebot_sim.ui.panels import PartsPanel, ResultsPanel, SetupPanel
 from battlebot_sim.ui.viewport import BotOnlyView, BotViewport
+from battlebot_sim.validation import validate_run_params
+
+logger = get_logger(__name__)
 
 
 class StreamWorker(QtCore.QObject):
@@ -49,15 +55,19 @@ class StreamWorker(QtCore.QObject):
         self.n_trials = n_trials
         self.fps = fps
         self._speed = max(0.05, float(speed))
-        self._cancel = False
+        # threading.Event: written from the UI thread (cancel), read in the worker
+        # loop. Its set/is_set are atomic, so no torn reads across the boundary.
+        self._cancel = threading.Event()
 
     @QtCore.Slot(float)
     def set_speed(self, value: float) -> None:
+        # Delivered via Qt's queued connection (set_speed is a Slot), so the
+        # assignment runs on the worker thread — already serialised, no lock needed.
         self._speed = max(0.05, float(value))
 
     @QtCore.Slot()
     def cancel(self) -> None:
-        self._cancel = True
+        self._cancel.set()
 
     @QtCore.Slot()
     def run(self) -> None:
@@ -76,7 +86,7 @@ class StreamWorker(QtCore.QObject):
             next_wall = time.perf_counter()
             i = 0
             while True:
-                if self._cancel:
+                if self._cancel.is_set():
                     try:                               # finalise the partial trace
                         stopped = gen.throw(GeneratorExit)
                     except StopIteration as stop:
@@ -104,7 +114,7 @@ class StreamWorker(QtCore.QObject):
 
                 sleep, next_wall = pace_schedule(
                     next_wall, frame_period, self._speed, time.perf_counter())
-                while sleep > 0.0 and not self._cancel:  # sliced so cancel lands fast
+                while sleep > 0.0 and not self._cancel.is_set():  # cancel lands fast
                     step = min(sleep, 0.05)
                     QtCore.QThread.msleep(int(step * 1000))
                     sleep -= step
@@ -112,6 +122,7 @@ class StreamWorker(QtCore.QObject):
             result = apply_brace_sharing(accum.finalize(), self.bot)
             self.finished.emit(trace, result)
         except Exception as exc:        # surface failures to the UI, don't swallow
+            logger.exception("stream worker failed")   # full traceback to the log
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
@@ -291,6 +302,13 @@ class MainWindow(QtWidgets.QMainWindow):
         wc = NHRL_CLASSES[class_key]
         n_trials = self.setup_panel.current_trials()
         speed = self.setup_panel.current_speed()
+        try:                                    # reject bad run settings up front
+            n_trials, fps = validate_run_params(n_trials, 60)
+        except ValidationError as exc:
+            logger.warning("invalid run settings: %s", exc)
+            QtWidgets.QMessageBox.critical(self, "Invalid run settings", str(exc))
+            self.statusBar().showMessage("Invalid run settings.")
+            return
         self.arena = build_arena(wc)
         self.viewport.show_arena(self.arena)
         self.viewport.begin_live()              # solid bot at rest, ready to fly
@@ -308,7 +326,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._thread = QtCore.QThread(self)
         self._worker = StreamWorker(self.bot, self.arena, wc, self.library,
-                                    n_trials, fps=60, speed=speed)
+                                    n_trials, fps=fps, speed=speed)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.chunk.connect(self._on_chunk)

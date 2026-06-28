@@ -7,18 +7,23 @@ engine-agnostic. It exposes the bot pose and per-step contacts as plain numpy.
 
 from __future__ import annotations
 
-import numpy as np
 import mujoco
+import numpy as np
 
 from battlebot_sim.arena.nhrl import Arena
+from battlebot_sim.config import DEFAULT_CONFIG
+from battlebot_sim.logging_setup import get_logger
 from battlebot_sim.mesh.segment import BotModel
 from battlebot_sim.sim.mjcf import build_mjcf
+
+logger = get_logger(__name__)
 
 
 class SimEngine:
     """A MuJoCo world containing the cage and one free-floating bot."""
 
-    def __init__(self, arena: Arena, bot: BotModel, timestep: float = 5e-4):
+    def __init__(self, arena: Arena, bot: BotModel,
+                 timestep: float = DEFAULT_CONFIG.sim.timestep):
         self.arena = arena
         self.bot = bot
         self.timestep = timestep
@@ -42,6 +47,8 @@ class SimEngine:
         try:
             return mujoco.MjModel.from_xml_string(xml), geom_map
         except Exception:
+            logger.info("explicit-inertia MJCF compile failed; retrying with "
+                        "geom-derived inertia", exc_info=True)
             xml, geom_map = build_mjcf(arena, bot, timestep, use_explicit_inertia=False)
             return mujoco.MjModel.from_xml_string(xml), geom_map
 

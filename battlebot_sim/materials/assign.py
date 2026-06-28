@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from battlebot_sim.validation import validate_mass
+
 LB_TO_KG = 0.45359237
 
 
@@ -67,6 +69,7 @@ def validate_weight_class(total_mass_kg: float, weight_class: WeightClass) -> We
 
     Returns a WeightCheck; `ok` is False when the bot exceeds the class limit.
     """
+    total_mass_kg = validate_mass(total_mass_kg)
     limit = weight_class.max_mass_kg
     if total_mass_kg <= limit:
         margin = limit - total_mass_kg

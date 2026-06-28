@@ -5,8 +5,6 @@ from __future__ import annotations
 import os
 from datetime import datetime
 
-import numpy as np
-
 from battlebot_sim import viz
 from battlebot_sim.damage.model import DamageResult
 from battlebot_sim.materials.assign import WeightClass, validate_weight_class

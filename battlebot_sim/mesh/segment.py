@@ -19,7 +19,11 @@ from pathlib import Path
 import numpy as np
 import trimesh
 
+from battlebot_sim.logging_setup import get_logger
 from battlebot_sim.materials.library import Material
+from battlebot_sim.validation import validate_mesh, validate_scale
+
+logger = get_logger(__name__)
 
 
 def sample_bot_path() -> str:
@@ -27,7 +31,7 @@ def sample_bot_path() -> str:
     frozen (.exe) runs. Shared by the entry-point self-test and the UI's
     'Load sample bot' action so they can never drift apart."""
     if getattr(sys, "frozen", False):
-        base = Path(getattr(sys, "_MEIPASS"))     # PyInstaller unpack dir
+        base = Path(sys._MEIPASS)     # PyInstaller unpack dir
     else:
         base = Path(__file__).resolve().parents[2]
     return str(base / "data" / "sample_bots" / "wedge_bot.stl")
@@ -49,6 +53,9 @@ def _hull_or_none(mesh: trimesh.Trimesh):
         with np.errstate(invalid="ignore", divide="ignore"):
             return mesh.convex_hull
     except Exception:       # scipy QhullError (and friends) on degenerate input
+        logger.debug("convex hull failed for a degenerate component "
+                     "(%d verts, %d faces); treating as zero-volume",
+                     len(mesh.vertices), len(mesh.faces), exc_info=True)
         return None
 
 
@@ -292,10 +299,12 @@ def load_bot(path: str, scale_to_m: float = 1.0) -> BotModel:
     STEP/IGES/Parasolid/JT/ACIS need a CAD kernel trimesh does not bundle; export
     3MF or glTF from the CAD tool instead.
     """
+    validate_scale(scale_to_m)
     loaded = trimesh.load(path)
     if isinstance(loaded, trimesh.Scene):
         original, parts = segment_scene(loaded, scale_to_m)
         if len(parts) >= 2:
+            validate_mesh(original)
             return BotModel(original=original, parts=parts)
         # One body (no per-part names to keep): fall back to connected
         # components on the already-scaled mesh, matching STL behaviour.
@@ -306,7 +315,6 @@ def load_bot(path: str, scale_to_m: float = 1.0) -> BotModel:
             raise ValueError(f"{path!r} did not load as a mesh or scene")
         if scale_to_m != 1.0:
             mesh.apply_scale(float(scale_to_m))
-    if len(mesh.faces) == 0:
-        raise ValueError(f"{path!r} contains no faces")
+    validate_mesh(mesh)        # finite verts, non-empty, sane bounding box
     parts = segment_mesh(mesh)
     return BotModel(original=mesh, parts=parts)
