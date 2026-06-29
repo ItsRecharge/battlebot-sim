@@ -1,0 +1,61 @@
+name: Build Windows EXE
+
+# Produces the frozen Windows app (Combat-Robot-Gauntlet.exe + _internal/) as a
+# downloadable artifact. Trigger it from the Actions tab ("Run workflow"), or
+# push a v* tag to also attach the zip to a GitHub Release.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write          # needed to attach the zip to a Release on tag builds
+
+jobs:
+  build-windows:
+    name: Build Windows .exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install app + PyInstaller
+        run: python -m pip install -e . pyinstaller
+
+      - name: Build (one-folder, windowed — same spec as macOS)
+        run: pyinstaller build/gauntlet.spec --noconfirm
+
+      - name: Smoke-test the frozen exe (--selftest)
+        shell: pwsh
+        env:
+          # Headless runner has no GL context; skip only the VTK render step.
+          # Imports, bundled data, trimesh and the MuJoCo native engine still run.
+          GAUNTLET_SELFTEST_SKIP_RENDER: "1"
+        run: |
+          $exe = "dist/Combat-Robot-Gauntlet/Combat-Robot-Gauntlet.exe"
+          $p = Start-Process -FilePath $exe -ArgumentList "--selftest" -Wait -PassThru
+          $log = Join-Path $env:TEMP "gauntlet_selftest.log"
+          if (Test-Path $log) { Get-Content $log }
+          if ($p.ExitCode -ne 0) { throw "selftest failed: exit $($p.ExitCode)" }
+
+      - name: Zip the dist folder
+        if: always()                       # ship the exe even if the smoke-test trips
+        shell: pwsh
+        run: Compress-Archive -Path dist/Combat-Robot-Gauntlet/* -DestinationPath Combat-Robot-Gauntlet-windows.zip
+
+      - name: Upload artifact (download from the run's Summary page)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Combat-Robot-Gauntlet-windows
+          path: Combat-Robot-Gauntlet-windows.zip
+
+      - name: Attach to Release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Combat-Robot-Gauntlet-windows.zip

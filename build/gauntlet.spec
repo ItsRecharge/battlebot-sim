@@ -1,12 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller spec for the Gauntlet.
 
-Build (from the project root):
-    .venv\\Scripts\\pyinstaller build\\gauntlet.spec --noconfirm
+Build (from the project root, same command on both OSes):
+    Windows:  .venv\\Scripts\\pyinstaller build\\gauntlet.spec --noconfirm
+    macOS:    .venv/bin/pyinstaller   build/gauntlet.spec --noconfirm
 
-Produces dist/Gauntlet/Gauntlet.exe (one-folder build). One-folder is
-deliberate: VTK is large and a one-file build unpacks hundreds of MB to a temp
-dir on every launch. Zip the dist/Gauntlet folder to distribute.
+Produces a one-folder build (deliberate: VTK is large and a one-file build
+unpacks hundreds of MB to a temp dir on every launch):
+    Windows -> dist/Combat-Robot-Gauntlet/Combat-Robot-Gauntlet.exe
+    macOS   -> dist/Combat-Robot-Gauntlet.app  (double-click, no Terminal)
+Zip the dist folder / .app to distribute.
 
 NOTE: we deliberately do NOT collect_all() vtkmodules or pyvista. Those force
 every VTK submodule to be imported at analysis time, and importing the OpenGL
@@ -16,12 +19,19 @@ correctly from the normal import graph instead.
 """
 
 import os
+import sys
 from PyInstaller.utils.hooks import (
     collect_data_files,
     collect_dynamic_libs,
 )
 
 PROJECT_ROOT = os.path.abspath(os.getcwd())
+
+# Per-platform app icon. Both are bundled into assets/ below so the running app
+# can load one at runtime (QIcon) regardless of which OS built it.
+ICO_PATH = os.path.join(PROJECT_ROOT, "build", "gauntlet.ico")
+ICNS_PATH = os.path.join(PROJECT_ROOT, "build", "gauntlet.icns")
+ICON = ICNS_PATH if sys.platform == "darwin" else ICO_PATH
 
 datas, binaries, hiddenimports = [], [], []
 
@@ -43,6 +53,13 @@ datas += collect_data_files("pyvistaqt")
 datas += [
     (os.path.join(PROJECT_ROOT, "data", "materials.json"), "data"),
     (os.path.join(PROJECT_ROOT, "data", "sample_bots"), os.path.join("data", "sample_bots")),
+]
+
+# App icons, bundled so the running app can set its window/taskbar icon at
+# runtime via gauntlet.__main__.app_icon_path() (resolves assets/ from _MEIPASS).
+datas += [
+    (ICO_PATH, "assets"),
+    (ICNS_PATH, "assets"),
 ]
 
 hiddenimports += [
@@ -93,13 +110,13 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="Gauntlet",
+    name="Combat-Robot-Gauntlet",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
     console=False,
-    icon=os.path.join(PROJECT_ROOT, "build", "gauntlet.ico"),
+    icon=ICON,
 )
 
 coll = COLLECT(
@@ -108,5 +125,21 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name="Gauntlet",
+    name="Combat-Robot-Gauntlet",
 )
+
+# macOS: wrap the one-folder build in a .app so double-clicking launches the
+# windowed GUI directly (no Terminal). Skipped on Windows, where COLLECT already
+# yields the windowed Combat-Robot-Gauntlet.exe (console=False above).
+if sys.platform == "darwin":
+    app = BUNDLE(
+        coll,
+        name="Combat-Robot-Gauntlet.app",
+        icon=ICNS_PATH,
+        bundle_identifier="com.neelbansal.combatrobotgauntlet",
+        info_plist={
+            "NSHighResolutionCapable": True,
+            "CFBundleName": "Combat-Robot-Gauntlet",
+            "CFBundleDisplayName": "Combat-Robot-Gauntlet",
+        },
+    )

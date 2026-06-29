@@ -23,6 +23,19 @@ def _sample_bot_path() -> Path:
     return Path(sample_bot_path())
 
 
+def app_icon_path() -> str:
+    """Absolute path to the platform app icon, resolved in dev and frozen runs.
+
+    Mirrors :func:`gauntlet.mesh.segment.sample_bot_path`: under PyInstaller the
+    bundled ``assets/`` lives in ``sys._MEIPASS``; in a source checkout it sits
+    at the project root. ``.icns`` on macOS, ``.ico`` everywhere else.
+    """
+    name = "gauntlet.icns" if sys.platform == "darwin" else "gauntlet.ico"
+    if getattr(sys, "frozen", False):
+        return str(Path(sys._MEIPASS) / "assets" / name)   # PyInstaller unpack dir
+    return str(Path(__file__).resolve().parents[1] / "build" / name)  # source checkout
+
+
 def _run_selftest() -> int:
     """Headless validation of the frozen bundle's hard parts.
 
@@ -72,9 +85,18 @@ def _run_selftest() -> int:
         result = compute_damage(trace, bot, arena, library)
         log(f"sim OK: {trace.total_contacts()} contacts")
 
-        png = os.path.join(tempfile.gettempdir(), "gauntlet_selftest.png")
-        viz.render_heatmap_png(bot, result, "failure", png)   # VTK off-screen
-        log(f"render OK: {png} ({os.path.getsize(png)} bytes)")
+        # VTK off-screen render needs a GL context. Headless CI runners
+        # (e.g. GitHub windows-latest) have none, so the render access-violates
+        # there even though the freeze is sound. Skip just this step when asked;
+        # everything above (imports, bundled data, trimesh, the MuJoCo native
+        # engine) has already been exercised. Verify the render locally / on a
+        # real desktop, where it runs by default.
+        if os.environ.get("GAUNTLET_SELFTEST_SKIP_RENDER"):
+            log("render SKIPPED (GAUNTLET_SELFTEST_SKIP_RENDER set — headless CI)")
+        else:
+            png = os.path.join(tempfile.gettempdir(), "gauntlet_selftest.png")
+            viz.render_heatmap_png(bot, result, "failure", png)   # VTK off-screen
+            log(f"render OK: {png} ({os.path.getsize(png)} bytes)")
 
         log("SELFTEST OK")
         return 0
@@ -97,20 +119,43 @@ def main() -> int:
     from gauntlet._bootstrap import preload_native_libraries
     from gauntlet.logging_setup import configure_logging
 
-    preload_native_libraries()      # pin native-lib load order before anything else
     level, logfile = _parse_log_args(sys.argv)
     configure_logging(level=level, logfile=logfile)
 
     if "--selftest" in sys.argv:
+        preload_native_libraries()  # headless path: pin load order, no GUI/splash
         return _run_selftest()
 
-    from PySide6 import QtWidgets
+    # GUI path: bring up Qt and a splash *before* the slow native preload, so the
+    # loading bar covers it (Qt isn't in the pinned native set, so showing it
+    # first doesn't disturb _bootstrap's ordering).
+    from PySide6 import QtGui, QtWidgets
 
-    from gauntlet.ui.main_window import MainWindow
+    from gauntlet.ui.splash import StartupSplash
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+    if sys.platform == "darwin":
+        # Force Fusion on macOS: the native Aqua push-button bezel clips longer
+        # labels ("Run stress battery"). Windows keeps its native style.
+        app.setStyle("Fusion")
+    icon = QtGui.QIcon(app_icon_path())
+    app.setWindowIcon(icon)
+
+    splash = StartupSplash(icon)
+    splash.show()
+    app.processEvents()
+
+    splash.step(15, "Loading physics engine…")
+    preload_native_libraries()      # pin native-lib load order before anything else
+
+    splash.step(70, "Building interface…")
+    from gauntlet.ui.main_window import MainWindow
+
     window = MainWindow()
+    window.setWindowIcon(icon)
+    splash.step(100, "Ready")
     window.show()
+    splash.finish(window)
     return app.exec()
 
 
