@@ -6,26 +6,32 @@ Both fields are per-face arrays over the *original* (full) mesh:
    closing_speed * dt is spread over nearby faces with a Gaussian falloff and
    summed across the whole battery. Answers "what took the most punishment".
 
-2. Failure margin (peak stress / yield): contact stress is estimated with a
-   Hertzian peak-pressure model
-       p0 = (6 * F * E*^2 / (pi^3 * R^2)) ** (1/3)
-   where E* is the effective modulus of the bot material and the surface it hit
-   (1/E* = (1-v^2)/E_bot + (1-v^2)/E_other, v = 0.3), and R is the part's
-   equivalent-sphere radius. The peak ratio p0 / yield is tracked per face.
-   Answers "where will it actually break" (>= 1 means yielding).
+2. Failure margin (governing stress / yield): an *absolute* per-part verdict
+   built from classical mechanics of materials (see ``damage/structural.py``):
+     * contact: the Hertzian peak pressure ``p0`` is taken to its subsurface
+       von-Mises peak (``sigma_vm,max = vm_factor * p0``, first yield at
+       ``p0 ~= 1.60 * yield``) using a combined-curvature radius that models the
+       opponent weapon as a sharp striker;
+     * structural: the impact also bends the part (``sigma_b = 6 b F L / w t^2``)
+       and crushes it (``sigma_m = F / A``);
+   the governing (larger) stress over yield is the margin (>= 1 means yielding).
+   This verdict is read at the true contact point, so it is independent of the
+   Gaussian heatmap-spread constants below.
 
-This is a simplified, comparative model (Hybrid accuracy) — not FEA.
+The heatmap fields are still a smoothed, comparative *picture*; the verdict is an
+analytic, hand-calc-grade absolute estimate — not FEA.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.spatial import cKDTree
 
 from battlebot_sim.arena.nhrl import Arena
 from battlebot_sim.config import DEFAULT_CONFIG, DamageConfig
+from battlebot_sim.damage import structural as st
 from battlebot_sim.materials.library import MaterialLibrary
 from battlebot_sim.mesh.segment import BotModel
 from battlebot_sim.sim.recorder import SimTrace
@@ -49,11 +55,17 @@ class DamageResult:
     """Per-face damage fields plus per-part summaries (original-mesh indexing)."""
 
     energy_per_face: np.ndarray        # (n_faces,) joules
-    peak_stress_per_face: np.ndarray   # (n_faces,) pascals
-    failure_margin_per_face: np.ndarray  # (n_faces,) stress / yield
+    peak_stress_per_face: np.ndarray   # (n_faces,) pascals (Gaussian-painted, render)
+    failure_margin_per_face: np.ndarray  # (n_faces,) stress / yield (render heatmap)
     face_part: np.ndarray              # (n_faces,) owning part index
-    part_max_margin: dict[int, float]
+    part_max_margin: dict[int, float]  # absolute governing margin per part
     part_total_energy: dict[int, float]
+    # Absolute per-part stress verdict (see damage/structural.py). ``part_stress``
+    # is parallel to ``bot.parts``; ``true_peak_stress_per_face`` is the
+    # un-attenuated governing stress at each contact's nearest face (verdict-grade,
+    # independent of the Gaussian heatmap spread above).
+    part_stress: list = field(default_factory=list)
+    true_peak_stress_per_face: np.ndarray | None = None
 
     def parts_that_fail(self, threshold: float = 1.0) -> list[int]:
         return [i for i, m in self.part_max_margin.items() if m >= threshold]
@@ -94,6 +106,15 @@ def _other_modulus(
         return opponent_modulus_pa
 
 
+def _indenter_radius(other: str, cfg: DamageConfig = DEFAULT_CONFIG.damage) -> float:
+    """Effective tip radius (m) of whatever struck the part. The opponent weapon
+    is a sharp striker (small radius -> high contact pressure); the arena
+    floor/wall is treated as near-flat (large radius)."""
+    if other == "opponent_weapon":
+        return cfg.weapon_tip_radius_m
+    return cfg.flat_surface_radius_m
+
+
 class DamageAccumulator:
     """Builds the per-face damage fields incrementally from contacts.
 
@@ -130,6 +151,11 @@ class DamageAccumulator:
         self.part_yield: dict[int, float] = {}
         self.part_modulus: dict[int, float] = {}
         self.part_char_len: dict[int, float] = {}
+        # Absolute-verdict precomputes (oriented section, surface curvature, ult).
+        self.part_section: dict[int, st.Section] = {}
+        self.part_surface_radius: dict[int, float] = {}
+        self.part_ultimate: dict[int, float] = {}
+        self.part_bends: dict[int, bool] = {}   # slender enough for beam bending?
         for p in bot.parts:
             self.face_part[p.face_ids] = p.index
             self.part_radius[p.index] = _part_radius(p.volume_m3)
@@ -138,6 +164,29 @@ class DamageAccumulator:
             mat = p.material
             self.part_yield[p.index] = mat.yield_pa if mat else np.inf
             self.part_modulus[p.index] = mat.youngs_pa if mat else 1.0
+            sec = st.section_from_vertices(np.asarray(p.mesh.vertices, dtype=float))
+            self.part_section[p.index] = sec
+            # A plate-like part is locally flat (R_surface = inf) so a sharp
+            # striker reads its true high contact stress; a chunky part keeps its
+            # equivalent-sphere curvature.
+            plate_like = (sec.t / max(sec.L, 1e-9)) < cfg.plate_flat_threshold
+            self.part_surface_radius[p.index] = (
+                np.inf if plate_like else self.part_radius[p.index])
+            self.part_ultimate[p.index] = mat.ultimate_pa if mat else np.inf
+            # Beam bending is only physical for a slender part that is also a real
+            # (not sub-mm shell/sliver) member; everything else is governed by
+            # contact/membrane stress instead.
+            self.part_bends[p.index] = (
+                sec.t >= cfg.bending_min_thickness_m
+                and sec.L / max(sec.t, 1e-9) >= cfg.bending_min_aspect)
+        # Subsurface von-Mises coefficient: configured, or derived from Poisson.
+        self.vm_factor = (cfg.contact_vm_factor if cfg.contact_vm_factor > 0
+                          else st.vm_factor_from_poisson(cfg.poisson))
+        # Per-part running maxima for the absolute verdict (all order-independent).
+        self.part_contact_vm = {p.index: 0.0 for p in bot.parts}
+        self.part_bending = {p.index: 0.0 for p in bot.parts}
+        self.part_membrane = {p.index: 0.0 for p in bot.parts}
+        self.part_struct = {p.index: 0.0 for p in bot.parts}
 
         # Spreading sigma config. With an explicit ``energy_falloff`` we keep a
         # fixed spread (legacy/override); otherwise each contact picks a sigma
@@ -148,6 +197,8 @@ class DamageAccumulator:
 
         self.energy = np.zeros(self.n_faces)
         self.peak_stress = np.zeros(self.n_faces)
+        # Un-attenuated governing stress at each contact's nearest face (verdict).
+        self.true_peak_stress = np.zeros(self.n_faces)
         # Per-face yield (fixed once parts/materials are set), for cheap margins.
         self.yield_per_face = np.array(
             [self.part_yield[int(self.face_part[f])] for f in range(self.n_faces)]
@@ -211,6 +262,27 @@ class DamageAccumulator:
             ws = np.exp(-(ds**2) / (2.0 * sigma_s**2))
             self.peak_stress[sidx] = np.maximum(self.peak_stress[sidx], p0 * ws)
 
+            # --- absolute verdict: un-attenuated structural pass (no painting) ---
+            # Evaluated at the true contact point with combined-curvature radius,
+            # so the verdict is independent of the heatmap sigma constants.
+            sec = self.part_section[pidx]
+            r_eff = st.effective_contact_radius(
+                _indenter_radius(c.other, self.cfg), self.part_surface_radius[pidx])
+            p0_true = _hertzian_peak_pressure(force, eff_E, r_eff)
+            contact_vm = st.contact_von_mises_peak(p0_true, self.vm_factor)
+            sigma_b = (st.bending_stress(
+                force, sec.L, sec.t, sec.w, self.cfg.bending_bc_factor)
+                if self.part_bends[pidx] else 0.0)
+            sigma_m = st.membrane_stress(force, sec.area)
+            struct = sigma_b + sigma_m
+            self.part_contact_vm[pidx] = max(self.part_contact_vm[pidx], contact_vm)
+            self.part_bending[pidx] = max(self.part_bending[pidx], sigma_b)
+            self.part_membrane[pidx] = max(self.part_membrane[pidx], sigma_m)
+            self.part_struct[pidx] = max(self.part_struct[pidx], struct)
+            nf = int(self.tree.query(c.local_pos)[1])
+            self.true_peak_stress[nf] = max(
+                self.true_peak_stress[nf], max(contact_vm, struct))
+
     def _failure_margin(self) -> np.ndarray:
         """Per-face peak stress / owning-part yield (0 where yield is non-finite)."""
         return np.divide(
@@ -224,17 +296,50 @@ class DamageAccumulator:
         return self.energy.copy(), self._failure_margin()
 
     def current_max_margin(self) -> float:
-        """Running worst failure margin across all faces (for live metrics)."""
-        fm = self._failure_margin()
-        return float(fm.max()) if fm.size else 0.0
+        """Running worst *governing* margin across parts (for live metrics).
+
+        Uses the absolute per-part verdict (the larger of the subsurface contact
+        von Mises and the structural bending+membrane stress, over the part's
+        yield), not the Gaussian-painted heatmap field."""
+        best = 0.0
+        for p in self.bot.parts:
+            y = self.part_yield[p.index]
+            if not (np.isfinite(y) and y > 0):
+                continue
+            gov = max(self.part_contact_vm[p.index], self.part_struct[p.index])
+            best = max(best, gov / y)
+        return float(best)
 
     def finalize(self) -> DamageResult:
-        """Snapshot the accumulated fields into a DamageResult."""
+        """Snapshot the accumulated fields into a DamageResult.
+
+        ``part_max_margin`` is the *absolute* governing margin per part (the
+        larger of the subsurface contact von Mises and the structural
+        bending+membrane stress, over yield) — independent of the Gaussian
+        heatmap spread. ``failure_margin_per_face`` is retained for rendering.
+        """
         failure_margin = self._failure_margin()
-        part_max_margin = {
-            p.index: float(failure_margin[p.face_ids].max()) if len(p.face_ids) else 0.0
-            for p in self.bot.parts
-        }
+        part_stress: list[st.PartStress] = []
+        part_max_margin: dict[int, float] = {}
+        for p in self.bot.parts:
+            i = p.index
+            cvm = self.part_contact_vm[i]
+            sb, sm, struct = (self.part_bending[i], self.part_membrane[i],
+                              self.part_struct[i])
+            if cvm >= struct:
+                gov, mode = cvm, "contact"
+            else:
+                gov, mode = struct, ("bending" if sb >= sm else "membrane")
+            y, ult = self.part_yield[i], self.part_ultimate[i]
+            margin = float(gov / y) if np.isfinite(y) and y > 0 else 0.0
+            sec = self.part_section[i]
+            part_stress.append(st.PartStress(
+                part_index=i, contact_stress=cvm, bending_stress=sb,
+                membrane_stress=sm, governing_stress=gov, governing_mode=mode,
+                span_used=sec.L, thickness_used=sec.t, margin=margin,
+                yields=margin >= 1.0,
+                fractures=bool(np.isfinite(ult) and ult > 0 and gov >= ult)))
+            part_max_margin[i] = margin
         part_total_energy = {
             p.index: float(self.energy[p.face_ids].sum()) for p in self.bot.parts
         }
@@ -245,6 +350,8 @@ class DamageAccumulator:
             face_part=self.face_part,
             part_max_margin=part_max_margin,
             part_total_energy=part_total_energy,
+            part_stress=part_stress,
+            true_peak_stress_per_face=self.true_peak_stress.copy(),
         )
 
 

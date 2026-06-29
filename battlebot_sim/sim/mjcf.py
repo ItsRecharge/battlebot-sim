@@ -31,10 +31,35 @@ def _fmt(values) -> str:
     return " ".join(f"{float(v):.6g}" for v in np.ravel(values))
 
 
+def _inflate_if_flat(verts: np.ndarray) -> np.ndarray:
+    """Give a set of points a third dimension if it is (near-)planar.
+
+    MuJoCo computes a convex hull for every ``<mesh>`` and *hard-rejects* a flat
+    one — ``ValueError: mesh '...' has coplanar vertices, cannot compute convex
+    hull``. A real bot has plenty of flat plates (armour, brackets) whose convex
+    hull is a planar polygon, so we detect rank-deficiency via the smallest
+    singular value and extrude the points a hair (1% of the part's extent) along
+    the plane normal into a thin box MuJoCo accepts.
+    """
+    if len(verts) < 4:
+        return verts
+    centered = verts - verts.mean(axis=0)
+    sing = np.linalg.svd(centered, compute_uv=False)
+    extent = max(float(np.ptp(verts, axis=0).max()), 1e-9)
+    if sing[-1] >= 1e-6 * extent:          # already genuinely 3D
+        return verts
+    normal = np.linalg.svd(centered, full_matrices=True)[2][-1]   # plane normal
+    thickness = 0.01 * extent
+    return np.vstack([verts + normal * thickness, verts - normal * thickness])
+
+
 def _hull_vertices(part) -> np.ndarray:
-    """Convex-hull vertices for a part, with a degenerate-shape guard."""
+    """Convex-hull vertices for a part, with degenerate- and flat-shape guards."""
     try:
-        verts = np.asarray(part.mesh.convex_hull.vertices, dtype=float)
+        # A flat/sliver part's hull integrates moments that divide by ~0; keep that
+        # internal float noise out of the output (mirrors segment._hull_or_none).
+        with np.errstate(invalid="ignore", divide="ignore"):
+            verts = np.asarray(part.mesh.convex_hull.vertices, dtype=float)
     except Exception:
         logger.debug("convex hull failed for part %r; using raw vertices",
                      getattr(part, "name", "?"), exc_info=True)
@@ -45,7 +70,7 @@ def _hull_vertices(part) -> np.ndarray:
         eps = 1e-3
         verts = np.vstack([c + [eps, 0, 0], c - [eps, 0, 0],
                            c + [0, eps, 0], c + [0, 0, eps]])
-    return verts
+    return _inflate_if_flat(verts)
 
 
 def build_mjcf(

@@ -147,6 +147,52 @@ def test_brace_absorbs_transferred_load():
     assert shared.part_max_margin[brace_idx] > 0.0
 
 
+def test_brace_relieves_structural_stress_in_part_stress():
+    """With a populated part_stress, a brace must relieve the bending/membrane of
+    the parts it bridges (a stiffer brace relieves more), without touching their
+    contact stress."""
+    library = load_default_library()
+    bot = _braced_bot(library, brace_thickness=0.02)
+    from battlebot_sim.damage.model import DamageResult
+    from battlebot_sim.damage.structural import PartStress
+
+    n_faces = len(bot.original.faces)
+    face_part = np.zeros(n_faces, dtype=np.int64)
+    for p in bot.parts:
+        face_part[p.face_ids] = p.index
+    brace_idx = len(bot.parts) - 1
+    yield_pa = library.get("Aluminum 6061-T6").yield_pa
+
+    # Cubes carry bending-governed stress; the brace starts unstressed.
+    part_stress = []
+    for p in bot.parts:
+        bend = 0.0 if p.is_brace else 200e6
+        part_stress.append(PartStress(
+            part_index=p.index, contact_stress=0.0, bending_stress=bend,
+            membrane_stress=0.0, governing_stress=bend,
+            governing_mode="bending", span_used=0.1, thickness_used=0.05,
+            margin=bend / yield_pa, yields=bend / yield_pa >= 1.0, fractures=False))
+    result = DamageResult(
+        energy_per_face=np.zeros(n_faces),
+        peak_stress_per_face=np.zeros(n_faces),
+        failure_margin_per_face=np.zeros(n_faces),
+        face_part=face_part,
+        part_max_margin={p.index: part_stress[i].margin for i, p in enumerate(bot.parts)},
+        part_total_energy={p.index: 0.0 for p in bot.parts},
+        part_stress=part_stress,
+        true_peak_stress_per_face=np.zeros(n_faces),
+    )
+
+    shared = apply_brace_sharing(result, bot)
+    by_idx = {ps.part_index: ps for ps in shared.part_stress}
+    # Adjacent cubes are relieved (bending dropped, margin below the raw 200 MPa).
+    assert by_idx[0].bending_stress < 200e6
+    assert shared.part_max_margin[0] < 200e6 / yield_pa
+    # The brace itself was unstressed and is not handed a synthetic transfer.
+    assert by_idx[brace_idx].bending_stress == 0.0
+    assert shared.part_max_margin[brace_idx] == 0.0
+
+
 def test_no_braces_is_noop():
     library = load_default_library()
     bot = _braced_bot(library)

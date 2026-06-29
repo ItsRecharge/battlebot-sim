@@ -11,9 +11,9 @@ compares the worst failure margin:
 
 | timestep | worst failure margin |
 |----------|----------------------|
-| 1.0e-3 s | 1.060123e-05 |
-| 5.0e-4 s (default) | 1.060123e-05 |
-| 2.5e-4 s | 1.060123e-05 |
+| 1.0e-3 s | 1.236084e+01 |
+| 5.0e-4 s (default) | 1.236084e+01 |
+| 2.5e-4 s | 1.236084e+01 |
 
 The verdict is **identical to six significant figures** across a 4× timestep range:
 it is driven by the hardest single contact, which the solver resolves the same way
@@ -28,29 +28,32 @@ swing in the worst failure margin. Representative ranking (braced two-cube bot):
 
 | constant | relative swing | reading |
 |----------|----------------|---------|
-| `damage.stress_sigma_frac` | ~19 | **dominant** |
-| `damage.sigma_patch_factor` | ~19 | **dominant** |
-| `damage.opponent_modulus_pa` | ~0.69 | moderate (`p0 ∝ E*^(2/3)`) |
-| `brace.transfer` | ~0.50 | moderate |
-| `damage.poisson` | ~0.46 | moderate |
-| `brace.k_ref`, `damage.sigma_min_frac` | ~0.01 | minor |
-| `damage.sigma_part_frac`, `kernel_radius_sigmas`, `brace.adjacency_tol` | ~0 | negligible |
+| `damage.contact_vm_factor` | ~0.50 | **dominant** (scales the contact von Mises directly) |
+| `damage.weapon_tip_radius_m` | ~0.32 | **dominant** (`p0 ∝ R_eff^(-2/3)`) |
+| `damage.opponent_modulus_pa` | ~0.09 | moderate (`p0 ∝ E*^(2/3)`) |
+| `damage.poisson` | ~0.07 | moderate |
+| `damage.sigma_*` (all heatmap-spread), `brace.*` | **0.000** | negligible — the verdict is now decoupled from them |
 
-### The important caveat (a real finding, not a bug)
+The verdict now responds **only** to physically meaningful contact-mechanics
+constants; the previously-dominant "appearance-only" sigma constants move it by
+exactly zero (see the `0.000` rows in `docs/sensitivity.md`). That is the headline
+result of the absolute-model rework. The single highest-value calibration target is
+now `weapon_tip_radius_m` (the assumed opponent striker sharpness).
 
-The sigma spread constants (`sigma_patch_factor`, `stress_sigma_frac`) **dominate the
-verdict on coarse meshes**, even though `docs/model_assumptions.md` describes them as
-"appearance only". The reason is mesh resolution: the peak stress is sampled at the
-nearest *face centroid*, and on a coarse mesh no face sits exactly at the contact
-point, so a Gaussian-weighted value `p0 · exp(−d²/2σ²) < p0` is recorded. A tighter
-sigma drops that weight steeply; a looser one approaches the true `p0`. On a
-**finely meshed** part (a face near every contact) this coupling vanishes and the
-constants behave as appearance-only.
+### Resolved: the verdict no longer depends on the spread constants
 
-**Implication:** absolute margins on coarse meshes are sigma-dependent and should be
-read *comparatively*, not as absolute yield predictions. To harden this, refine the
-mesh near contacts (so a centroid lands at the peak) before relying on absolute
-numbers — the single highest-value calibration follow-up.
+This used to be the model's biggest fidelity risk. The verdict was read off the
+Gaussian-painted per-face field, so on a coarse mesh — where no face centroid sits
+exactly at the contact point — a tighter sigma recorded `p0 · exp(−d²/2σ²) < p0` and
+the "appearance-only" constants (`sigma_patch_factor`, `stress_sigma_frac`) dominated
+the margin.
+
+The absolute model removed the coupling entirely: the verdict is now computed from
+the **un-attenuated governing stress at the true contact point**, independent of any
+sigma. `tests/validation/test_true_peak.py` pins this — a 4× sigma swing moves the
+rendered heatmap but leaves `part_max_margin` bit-identical. The sigmas now affect
+**only** the picture, exactly as `docs/model_assumptions.md` claims — the sensitivity
+table above confirms a `0.000` swing for every one of them.
 
 ## Reproducing
 

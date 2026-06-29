@@ -2,12 +2,32 @@
 
 from __future__ import annotations
 
+import random
+from contextlib import contextmanager
+
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from battlebot_sim import viz
 from battlebot_sim.materials.assign import NHRL_CLASSES
 from battlebot_sim.materials.library import MaterialLibrary
-from battlebot_sim.mesh.segment import BotModel
+from battlebot_sim.mesh.segment import DEFAULT_MAX_PARTS, BotModel
+from battlebot_sim.sim.battery import (
+    DEFAULT_DROP_TILT_RANGE_DEG,
+    DEFAULT_VELOCITY_CEILING,
+    class_speed,
+)
+
+
+@contextmanager
+def _blocked(*widgets):
+    """Temporarily block Qt signals on ``widgets`` (avoids slider<->spinbox loops)."""
+    for w in widgets:
+        w.blockSignals(True)
+    try:
+        yield
+    finally:
+        for w in widgets:
+            w.blockSignals(False)
 
 
 class PartsPanel(QtWidgets.QGroupBox):
@@ -88,6 +108,10 @@ class PartsPanel(QtWidgets.QGroupBox):
                 self.table.setCellWidget(p.index, 1, combo)
 
                 check = QtWidgets.QCheckBox()
+                check.setChecked(bool(p.is_brace))
+                check.setToolTip(
+                    "Structural brace: bridges and stiffens other parts. "
+                    "Auto-detected on import; tick/untick to override.")
                 check.stateChanged.connect(
                     lambda state, idx=p.index: self._on_brace(idx, state))
                 holder = QtWidgets.QWidget()
@@ -148,6 +172,20 @@ class PartsPanel(QtWidgets.QGroupBox):
             return
         self.bot.set_brace(idx, bool(state))
         self.changed.emit()
+
+    def refresh_braces(self) -> None:
+        """Re-sync the brace checkboxes to the model (e.g. after auto-detection)
+        without emitting change signals or clobbering a user's manual choice."""
+        if self.bot is None:
+            return
+        for p in self.bot.parts:
+            holder = self.table.cellWidget(p.index, 2)
+            check = holder.findChild(QtWidgets.QCheckBox) if holder else None
+            if check is None:
+                continue
+            check.blockSignals(True)
+            check.setChecked(bool(p.is_brace))
+            check.blockSignals(False)
 
     def _refresh_masses(self) -> None:
         if self.bot is None:
@@ -234,6 +272,7 @@ class SetupPanel(QtWidgets.QGroupBox):
     run_requested = QtCore.Signal(str)            # weight class key
     stop_requested = QtCore.Signal()              # cancel a running battery
     speed_changed = QtCore.Signal(float)          # live playback speed multiplier
+    units_changed = QtCore.Signal()               # Model-units dropdown changed
 
     # STL import units -> factor converting one source unit to metres. Listed in
     # the order shown in the dropdown (metric first, then imperial); millimetres
@@ -254,6 +293,8 @@ class SetupPanel(QtWidgets.QGroupBox):
 
         self.unit_combo = QtWidgets.QComboBox()
         self.unit_combo.addItems(list(self.UNIT_SCALES_M))
+        # Changing units after a model is loaded re-scales it (see MainWindow).
+        self.unit_combo.currentIndexChanged.connect(self.units_changed.emit)
 
         self.load_btn = QtWidgets.QPushButton("Load model…")
         self.sample_btn = QtWidgets.QPushButton("Load sample bot")
@@ -266,6 +307,74 @@ class SetupPanel(QtWidgets.QGroupBox):
             "More trials test more impact angles and orientations (a systematic "
             "sweep plus seeded random extras). Damage accumulates across every "
             "trial into one worst-case map. Higher = more thorough but slower.")
+
+        # --- per-trial randomisation envelope (higher/seeded velocity + drop angle) ---
+        # Impact speed range (m/s), drawn per trial from the seed. min == max gives a
+        # fixed manual speed; the slider drives the upper bound for quick tuning.
+        self.vel_min_spin = QtWidgets.QDoubleSpinBox()
+        self.vel_min_spin.setRange(0.5, 40.0)
+        self.vel_min_spin.setSingleStep(0.5)
+        self.vel_min_spin.setSuffix(" m/s")
+        self.vel_min_spin.setToolTip(
+            "Lowest impact speed a trial may use. Set equal to the max for a fixed speed.")
+        self.vel_max_spin = QtWidgets.QDoubleSpinBox()
+        self.vel_max_spin.setRange(0.5, 40.0)
+        self.vel_max_spin.setSingleStep(0.5)
+        self.vel_max_spin.setSuffix(" m/s")
+        self.vel_max_spin.setToolTip(
+            "Highest impact speed a trial may use (drag the slider to tune).")
+        self.vel_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.vel_slider.setRange(1, 40)
+        self.vel_slider.setToolTip("Manual impact-speed control — sets the maximum speed.")
+        vel_row = QtWidgets.QHBoxLayout()
+        vel_row.addWidget(self.vel_min_spin)
+        vel_row.addWidget(QtWidgets.QLabel("to"))
+        vel_row.addWidget(self.vel_max_spin)
+        self.vel_min_spin.valueChanged.connect(self._on_vel_min_changed)
+        self.vel_max_spin.valueChanged.connect(self._on_vel_max_changed)
+        self.vel_slider.valueChanged.connect(self._on_vel_slider_changed)
+
+        # Drop-angle (tilt) range in degrees, drawn per trial from the seed:
+        # 0° is a flat drop, higher tilts land the bot on an edge or corner.
+        self.drop_min_spin = QtWidgets.QSpinBox()
+        self.drop_min_spin.setRange(0, 90)
+        self.drop_min_spin.setValue(int(DEFAULT_DROP_TILT_RANGE_DEG[0]))
+        self.drop_min_spin.setSuffix(" °")
+        self.drop_max_spin = QtWidgets.QSpinBox()
+        self.drop_max_spin.setRange(0, 90)
+        self.drop_max_spin.setValue(int(DEFAULT_DROP_TILT_RANGE_DEG[1]))
+        self.drop_max_spin.setSuffix(" °")
+        for s in (self.drop_min_spin, self.drop_max_spin):
+            s.setToolTip("Range of drop tilt angles tested (0° = flat, higher = on an edge).")
+        drop_row = QtWidgets.QHBoxLayout()
+        drop_row.addWidget(self.drop_min_spin)
+        drop_row.addWidget(QtWidgets.QLabel("to"))
+        drop_row.addWidget(self.drop_max_spin)
+
+        # Seed makes the random trials reproducible; "New seed" rolls a fresh one.
+        self.seed_spin = QtWidgets.QSpinBox()
+        self.seed_spin.setRange(0, 2_147_483_647)
+        self.seed_spin.setToolTip(
+            "Random seed for the trial sweep. Same seed → identical battery; change it "
+            "(or click New seed) to explore a different set of impacts.")
+        self.new_seed_btn = QtWidgets.QPushButton("New seed")
+        self.new_seed_btn.setToolTip("Roll a fresh random seed.")
+        self.new_seed_btn.clicked.connect(self._roll_seed)
+        seed_row = QtWidgets.QHBoxLayout()
+        seed_row.addWidget(self.seed_spin, 1)
+        seed_row.addWidget(self.new_seed_btn)
+
+        # Max parts: cap on segmentation so a fragmented CAD/STL still loads & runs.
+        self.maxparts_spin = QtWidgets.QSpinBox()
+        self.maxparts_spin.setRange(8, 512)
+        self.maxparts_spin.setValue(DEFAULT_MAX_PARTS)
+        self.maxparts_spin.setToolTip(
+            "Maximum number of parts a model is split into. A messy mesh that fragments "
+            "past this is simplified (smallest fragments merged) so it still loads.")
+
+        # Velocity defaults follow the weight class; re-apply when the class changes.
+        self._apply_class_speed_defaults()
+        self.class_combo.currentIndexChanged.connect(self._apply_class_speed_defaults)
 
         # Live playback speed: the battery runs at (scaled) real time so the bot
         # is watchable flying around the cage. MuJoCo is much faster than real
@@ -305,6 +414,11 @@ class SetupPanel(QtWidgets.QGroupBox):
         form.addRow(self.load_btn)
         form.addRow(self.sample_btn)
         form.addRow("Trials:", self.trials_spin)
+        form.addRow("Impact speed:", vel_row)
+        form.addRow("", self.vel_slider)
+        form.addRow("Drop angle:", drop_row)
+        form.addRow("Seed:", seed_row)
+        form.addRow("Max parts:", self.maxparts_spin)
         form.addRow("Playback speed:", self.speed_spin)
         form.addRow(run_row)
         form.addRow(self.cage_check)
@@ -318,6 +432,10 @@ class SetupPanel(QtWidgets.QGroupBox):
     def _scale_to_m(self) -> float:
         return self.UNIT_SCALES_M[self.unit_combo.currentText()]
 
+    def current_scale_to_m(self) -> float:
+        """The metres-per-source-unit factor for the selected Model units."""
+        return self._scale_to_m()
+
     def _choose_file(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Open model", "",
@@ -328,10 +446,48 @@ class SetupPanel(QtWidgets.QGroupBox):
             self.load_requested.emit(path, self._scale_to_m())
 
     def _load_sample(self) -> None:
-        """Load the bundled demo bot. It is authored in metres, so it ignores
-        the units dropdown (scale 1.0) and gives an instant known-good run."""
-        from battlebot_sim.mesh.segment import sample_bot_path
-        self.load_requested.emit(sample_bot_path(), 1.0)
+        """Load the bundled demo bot. It is authored in centimetres, so it ignores
+        the units dropdown (fixed scale) and gives an instant known-good run."""
+        from battlebot_sim.mesh.segment import SAMPLE_SCALE_TO_M, sample_bot_path
+        self.load_requested.emit(sample_bot_path(), SAMPLE_SCALE_TO_M)
+
+    # ---- trial-randomisation controls -----------------------------------
+    def _apply_class_speed_defaults(self, *_) -> None:
+        """Seed the velocity range from the selected class's representative speed
+        (min = class speed, max = a higher multiple of it)."""
+        key = self.class_combo.currentData()
+        if key is None:
+            return
+        base = class_speed(NHRL_CLASSES[key])
+        lo = round(base, 1)
+        hi = round(min(base * DEFAULT_VELOCITY_CEILING, self.vel_max_spin.maximum()), 1)
+        with _blocked(self.vel_min_spin, self.vel_max_spin, self.vel_slider):
+            self.vel_min_spin.setValue(lo)
+            self.vel_max_spin.setValue(hi)
+            self.vel_slider.setValue(int(round(hi)))
+
+    def _on_vel_min_changed(self, value: float) -> None:
+        if value > self.vel_max_spin.value():       # keep min <= max
+            with _blocked(self.vel_max_spin, self.vel_slider):
+                self.vel_max_spin.setValue(value)
+                self.vel_slider.setValue(int(round(value)))
+
+    def _on_vel_max_changed(self, value: float) -> None:
+        with _blocked(self.vel_slider):
+            self.vel_slider.setValue(int(round(value)))
+        if value < self.vel_min_spin.value():
+            with _blocked(self.vel_min_spin):
+                self.vel_min_spin.setValue(value)
+
+    def _on_vel_slider_changed(self, value: int) -> None:
+        with _blocked(self.vel_max_spin):
+            self.vel_max_spin.setValue(float(value))
+        if float(value) < self.vel_min_spin.value():
+            with _blocked(self.vel_min_spin):
+                self.vel_min_spin.setValue(float(value))
+
+    def _roll_seed(self) -> None:
+        self.seed_spin.setValue(random.randrange(0, 2_147_483_647))
 
     def current_class_key(self) -> str:
         return self.class_combo.currentData()
@@ -341,6 +497,20 @@ class SetupPanel(QtWidgets.QGroupBox):
 
     def current_speed(self) -> float:
         return float(self.speed_spin.value())
+
+    def current_velocity_range(self) -> tuple[float, float]:
+        lo, hi = float(self.vel_min_spin.value()), float(self.vel_max_spin.value())
+        return (lo, hi) if lo <= hi else (hi, lo)
+
+    def current_drop_angle_range(self) -> tuple[float, float]:
+        lo, hi = float(self.drop_min_spin.value()), float(self.drop_max_spin.value())
+        return (lo, hi) if lo <= hi else (hi, lo)
+
+    def current_seed(self) -> int:
+        return int(self.seed_spin.value())
+
+    def current_max_parts(self) -> int:
+        return int(self.maxparts_spin.value())
 
     def show_running(self, running: bool) -> None:
         """Flip the panel between idle and running: while a battery runs, Run is
@@ -353,6 +523,10 @@ class SetupPanel(QtWidgets.QGroupBox):
         self.trials_spin.setEnabled(not running)
         self.class_combo.setEnabled(not running)
         self.unit_combo.setEnabled(not running)
+        for w in (self.vel_min_spin, self.vel_max_spin, self.vel_slider,
+                  self.drop_min_spin, self.drop_max_spin, self.seed_spin,
+                  self.new_seed_btn, self.maxparts_spin):
+            w.setEnabled(not running)
         self.progress.setVisible(running)
 
 

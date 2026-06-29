@@ -15,7 +15,7 @@ from battlebot_sim.arena.nhrl import build_arena
 from battlebot_sim.damage.model import DamageResult, compute_damage
 from battlebot_sim.materials.assign import NHRL_CLASSES
 from battlebot_sim.materials.library import load_default_library
-from battlebot_sim.mesh.segment import load_bot, sample_bot_path
+from battlebot_sim.mesh.segment import SAMPLE_SCALE_TO_M, load_bot, sample_bot_path
 from battlebot_sim.sim.battery import StressBattery, run_battery
 from battlebot_sim.sim.recorder import SimTrace
 
@@ -31,7 +31,7 @@ def run_selftest_pipeline(seed: int = 0, n_trials: int = 1, fps: int = 30):
     from battlebot_sim.sim.engine import SimEngine
 
     library = load_default_library()
-    bot = load_bot(str(sample_bot_path()), scale_to_m=1.0)
+    bot = load_bot(str(sample_bot_path()), scale_to_m=SAMPLE_SCALE_TO_M)
     bot.assign_material_to_all(library.get("Aluminum 6061-T6"))
     cls = NHRL_CLASSES["3lb"]
     arena = build_arena(cls)

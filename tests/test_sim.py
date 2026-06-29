@@ -144,6 +144,75 @@ def test_overweight_bot_still_simulates(aluminum):
     assert np.all(np.isfinite(engine.get_pose()[0]))
 
 
+# ---- coplanar-hull guard (complex-STL crash regression) --------------------
+
+def _flat_plate() -> trimesh.Trimesh:
+    """A single coplanar quad (z = 0): its convex hull is planar, which MuJoCo
+    hard-rejects unless the hull is inflated to a thin box."""
+    verts = np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0],
+                      [0.1, 0.1, 0.0], [0.0, 0.1, 0.0]])
+    faces = np.array([[0, 1, 2], [0, 2, 3]])
+    return trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+
+
+def test_hull_vertices_inflates_coplanar_part():
+    from battlebot_sim.mesh.segment import Part
+    from battlebot_sim.sim.mjcf import _hull_vertices
+
+    part = Part(index=0, mesh=_flat_plate(), face_ids=np.array([0, 1]))
+    verts = _hull_vertices(part)
+    # The returned hull points must span all three dimensions (rank 3), else
+    # MuJoCo's qhull rejects them with a coplanar-vertices ValueError.
+    assert np.linalg.matrix_rank(verts - verts.mean(axis=0)) == 3
+
+
+def test_coplanar_plate_bot_compiles(aluminum):
+    """A bot whose part is a flat plate compiles in MuJoCo (regression: the real
+    complex STL crashed on a coplanar 'hull_159')."""
+    plate = _flat_plate()
+    bot = BotModel(plate, segment_mesh(plate))
+    bot.assign_material_to_all(aluminum)
+    arena = build_arena(NHRL_CLASSES["3lb"])
+    engine = SimEngine(arena, bot)            # must not raise
+    assert engine.model.ngeom >= 1 + len(bot.parts)
+
+
+# ---- seeded velocity / drop-angle randomisation ----------------------------
+
+def _event_signature(battery):
+    return np.concatenate(
+        [e.init_linvel for e in battery.events]
+        + [e.init_quat for e in battery.events]
+    )
+
+
+def test_seeded_velocity_and_drop_angle_reproducible():
+    wc = NHRL_CLASSES["12lb"]
+    arena = build_arena(wc)
+    kw = dict(n_trials=3, velocity_range=(8.0, 20.0), drop_tilt_range_deg=(0.0, 60.0))
+    same_a = StressBattery(arena, wc, seed=123, **kw)
+    same_b = StressBattery(arena, wc, seed=123, **kw)
+    other = StressBattery(arena, wc, seed=999, **kw)
+
+    assert len(same_a.events) >= 6
+    assert np.allclose(_event_signature(same_a), _event_signature(same_b))
+    assert not np.allclose(_event_signature(same_a), _event_signature(other))
+
+    speeds = [e.trial_speed for e in same_a.events if e.trial_speed is not None]
+    assert speeds and all(8.0 - 1e-9 <= s <= 20.0 + 1e-9 for s in speeds)
+    tilts = [e.trial_tilt_deg for e in same_a.events if e.trial_tilt_deg is not None]
+    assert tilts and all(0.0 - 1e-9 <= t <= 60.0 + 1e-9 for t in tilts)
+
+
+def test_pinned_velocity_range_is_fixed_speed():
+    """min == max draws no randomness: every launch uses exactly that speed."""
+    wc = NHRL_CLASSES["12lb"]
+    arena = build_arena(wc)
+    battery = StressBattery(arena, wc, n_trials=4, velocity_range=(12.0, 12.0))
+    speeds = [e.trial_speed for e in battery.events if e.trial_speed is not None]
+    assert speeds and all(np.isclose(s, 12.0) for s in speeds)
+
+
 # ---- streaming generator ---------------------------------------------------
 
 def _drain(gen):

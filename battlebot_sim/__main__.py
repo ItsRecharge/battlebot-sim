@@ -7,6 +7,8 @@
 
 --selftest is used to smoke-test the packaged .exe: it verifies imports, the Qt
 window, the VTK viewport, and bundled-data resolution all work, then quits.
+
+Made by Neel Bansal.
 """
 
 from __future__ import annotations
@@ -52,12 +54,12 @@ def _run_selftest() -> int:
         from battlebot_sim.damage.model import compute_damage
         from battlebot_sim.materials.assign import NHRL_CLASSES
         from battlebot_sim.materials.library import load_default_library
-        from battlebot_sim.mesh.segment import load_bot
+        from battlebot_sim.mesh.segment import SAMPLE_SCALE_TO_M, load_bot
         from battlebot_sim.sim.battery import StressBattery, run_battery
         from battlebot_sim.sim.engine import SimEngine
 
         library = load_default_library()
-        bot = load_bot(str(sample), scale_to_m=1.0)
+        bot = load_bot(str(sample), scale_to_m=SAMPLE_SCALE_TO_M)
         bot.assign_material_to_all(library.get("Aluminum 6061-T6"))
         log(f"loaded bot: {len(bot.parts)} parts, mass={bot.total_mass():.3f} kg")
         if len(bot.parts) == 0:

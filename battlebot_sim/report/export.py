@@ -48,27 +48,43 @@ def export_report(
 
     lines.append("## Per-part damage")
     lines.append("")
-    lines.append("| # | Part | Material | Brace | Mass (kg) | Max failure margin | Verdict | Impact energy (J) |")
-    lines.append("|---|------|----------|-------|-----------|--------------------|---------|-------------------|")
+    lines.append("Margin is the absolute governing stress over yield (≥ 1 yields); "
+                 "the mode says whether contact, bending or membrane stress drives it.")
+    lines.append("")
+    lines.append("| # | Part | Material | Brace | Mass (kg) | Margin | Mode | Thickness (mm) | Verdict | Impact energy (J) |")
+    lines.append("|---|------|----------|-------|-----------|--------|------|----------------|---------|-------------------|")
+    ps_by_idx = {ps.part_index: ps for ps in result.part_stress}
     for p in bot.parts:
         margin = result.part_max_margin.get(p.index, 0.0)
         energy = result.part_total_energy.get(p.index, 0.0)
-        verdict = "FAIL ⚠️" if margin >= 1.0 else "ok"
+        ps = ps_by_idx.get(p.index)
+        if ps is not None and ps.fractures:
+            verdict = "FRACTURE ⛔"
+        elif margin >= 1.0:
+            verdict = "FAIL ⚠️"
+        else:
+            verdict = "ok"
+        mode = ps.governing_mode if ps is not None else "—"
+        thick = f"{ps.thickness_used * 1e3:.1f}" if ps is not None else "—"
         mat = p.material.name if p.material else "—"
         lines.append(
             f"| {p.index} | {p.name} | {mat} | {'yes' if p.is_brace else ''} | "
-            f"{p.mass_kg:.3f} | {margin:.2f} | {verdict} | {energy:.2f} |"
+            f"{p.mass_kg:.3f} | {margin:.2f} | {mode} | {thick} | {verdict} | {energy:.2f} |"
         )
     lines.append("")
 
     failing = result.parts_that_fail()
+    fracturing = [ps.part_index for ps in result.part_stress if ps.fractures]
     lines.append("## Verdict")
     lines.append("")
+    if fracturing:
+        names = ", ".join(bot.parts[i].name for i in fracturing)
+        lines.append(f"⛔ **{len(fracturing)} part(s) predicted to fracture:** {names}.")
     if failing:
         names = ", ".join(bot.parts[i].name for i in failing)
         lines.append(f"⚠️ **{len(failing)} part(s) predicted to yield:** {names}.")
         lines.append("Consider a stronger material, thicker section, or added bracing there.")
-    else:
+    if not failing and not fracturing:
         lines.append("✅ No part exceeded its material yield in this battery.")
     lines.append("")
 
@@ -91,8 +107,12 @@ def export_report(
     lines.append("![Impact energy](heatmap_energy.png)")
     lines.append("")
     lines.append("---")
-    lines.append("_Hybrid model: simplified Hertzian contact stress + brace load-sharing. "
-                 "Results are comparative, not certification-grade._")
+    lines.append("_Analytic absolute model: subsurface von-Mises contact yield "
+                 "(first yield at p0 ≈ 1.6·yield) + beam/plate bending & membrane "
+                 "stress + brace load-sharing. Hand-calc grade, not FEA — see "
+                 "docs/model_assumptions.md._")
+    lines.append("")
+    lines.append("_Made by Neel Bansal._")
 
     md_path = os.path.join(out_dir, "report.md")
     with open(md_path, "w", encoding="utf-8") as f:

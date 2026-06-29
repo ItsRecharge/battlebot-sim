@@ -171,3 +171,50 @@ def test_merge_reduces_part_count(two_box_bot, aluminum):
     assert len(model.parts) == before - 1
     # Mass is conserved across a merge.
     assert np.isclose(model.total_mass(), mass_before, rtol=1e-6)
+
+
+def _many_disjoint_boxes(n: int) -> trimesh.Trimesh:
+    """``n`` spatially separated unit-ish boxes -> ``n`` connected components."""
+    boxes = []
+    for i in range(n):
+        box = trimesh.creation.box(extents=(0.02, 0.02, 0.02))
+        box.apply_translation((0.1 * i, 0.0, 0.0))   # keep them disjoint
+        boxes.append(box)
+    return trimesh.util.concatenate(boxes)
+
+
+def test_segment_caps_part_count():
+    """A mesh that fragments past ``max_parts`` is reduced to exactly that many
+    parts (smallest fragments fused into one aggregate)."""
+    mesh = _many_disjoint_boxes(80)
+    assert len(segment_mesh(mesh, max_parts=None)) == 80   # uncapped baseline
+    parts = segment_mesh(mesh, max_parts=16)
+    assert len(parts) == 16
+    # No faces are lost: the cap merges, it does not drop geometry.
+    all_faces = np.concatenate([p.face_ids for p in parts])
+    assert len(np.unique(all_faces)) == len(mesh.faces)
+
+
+def test_load_bot_records_source_fragments(tmp_path):
+    """Loading a fragmented STL caps the parts and records the pre-cap count so the
+    UI can report the simplification."""
+    out = tmp_path / "fragmented.stl"
+    _many_disjoint_boxes(50).export(out)
+    bot = load_bot(str(out), scale_to_m=1.0, max_parts=8)
+    assert len(bot.parts) == 8
+    assert bot.source_fragments == 50
+
+
+def _complex_stl_path():
+    from pathlib import Path
+    return Path(__file__).resolve().parents[1] / "test_stl" / "bot test 1.stl"
+
+
+@pytest.mark.skipif(not _complex_stl_path().exists(),
+                    reason="complex sample STL not present")
+def test_complex_stl_loads_and_is_capped():
+    """The real 150k-face, 11k-fragment bot loads, welds, and caps instead of
+    exploding into thousands of parts (regression for the upload crash)."""
+    bot = load_bot(str(_complex_stl_path()), scale_to_m=1.0, max_parts=64)
+    assert len(bot.parts) <= 64
+    assert bot.source_fragments > len(bot.parts)   # genuinely fragmented source

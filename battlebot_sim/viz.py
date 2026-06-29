@@ -115,12 +115,13 @@ def scalar_bar_spec(mode: str, title: str | None = None) -> dict:
 def heat_mesh_kwargs(mode, cmap, clim, title, log_scale) -> dict:
     """``add_mesh`` kwargs shared by the live viewport, the bot-only view and the
     report PNG so all three render the heatmap identically: vertex-interpolated
-    point scalars (a smooth exponential gradient, not per-triangle cells), a
-    neutral colour for undamaged geometry, and the key/legend."""
+    point scalars (a smooth exponential gradient, not per-triangle cells) and the
+    key/legend. Undamaged geometry sits at the bottom of the key (not greyed
+    out); ``nan_color`` is only a safety net for stray non-finite scalars."""
     kwargs = dict(
         scalars=mode, preference="point", cmap=cmap, clim=clim, log_scale=log_scale,
         interpolate_before_map=True, smooth_shading=True, show_edges=False,
-        nan_color=UNASSIGNED_COLOR, nan_opacity=1.0,
+        nan_color=UNASSIGNED_COLOR, nan_opacity=1.0,   # safety net for stray NaNs
         # Lighting on (smooth shading needs it) but ambient-heavy/low-specular so
         # the colour — not the studio rig — carries the damage reading.
         ambient=0.30, diffuse=0.68, specular=0.10,
@@ -167,7 +168,9 @@ def attach_field_smooth(
     field as POINT scalars — a continuous exponential gradient instead of flat
     per-triangle cells. Coarse meshes are midpoint-subdivided first (geometry
     preserved) so the gradient has somewhere to live, and undamaged geometry is
-    set to NaN so it renders neutral and the hotspots pop.
+    pinned to the bottom of the colour key (the key's zero end — black on
+    inferno) rather than greyed out, so an untested part reads as zero damage
+    instead of "no data".
 
     Returns ``(heat_poly, cmap, clim, title, log_scale)``. Energy spans orders of
     magnitude so it is log-scaled (real joules stay on the bar); failure margin
@@ -193,20 +196,30 @@ def attach_field_smooth(
     heat = pv.PolyData(sv, _faces_to_pv(sf))
     positive = svals[svals > 0]
     disp = svals.astype(float).copy()
-    disp[disp <= 0] = np.nan                   # undamaged -> neutral nan_color
-    heat.point_data[mode] = disp
-    heat.set_active_scalars(mode, preference="point")
+    disp[disp < 0] = 0.0                        # clamp stray negatives from interp
 
     spec = FIELD_SPECS[mode]
     if mode == "failure":
+        # Linear scale: undamaged geometry stays at 0 == the bottom of the key,
+        # so an untested part reads as "zero margin" (the key's low end), not a
+        # greyed-out "no data" patch.
         vmax = float(positive.max()) if positive.size else 0.0
-        return heat, spec["cmap"], [0.0, max(1.0, vmax)], spec["title"], False
-    if positive.size == 0:                      # nothing took any energy yet
-        return heat, spec["cmap"], [0.0, 1e-9], "Impact Energy (J)", False
-    vmin, vmax = float(positive.min()), float(positive.max())
-    if vmax <= vmin:
-        vmax = vmin * 1.0001 + 1e-12            # log scale needs vmax > vmin > 0
-    return heat, spec["cmap"], [vmin, vmax], spec["title"], True
+        clim, title, log_scale = [0.0, max(1.0, vmax)], spec["title"], False
+    elif positive.size == 0:                    # nothing took any energy yet
+        clim, title, log_scale = [0.0, 1e-9], "Impact Energy (J)", False
+    else:
+        vmin, vmax = float(positive.min()), float(positive.max())
+        if vmax <= vmin:
+            vmax = vmin * 1.0001 + 1e-12        # log scale needs vmax > vmin > 0
+        # A log scale has no true zero, so pin undamaged geometry to vmin: it
+        # renders at the bottom of the key (black on inferno) rather than a
+        # neutral grey, keeping "untested == the key's zero end".
+        disp[disp <= 0] = vmin
+        clim, title, log_scale = [vmin, vmax], spec["title"], True
+
+    heat.point_data[mode] = disp
+    heat.set_active_scalars(mode, preference="point")
+    return heat, spec["cmap"], clim, title, log_scale
 
 
 def render_heatmap_png(

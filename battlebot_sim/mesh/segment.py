@@ -25,16 +25,30 @@ from battlebot_sim.validation import validate_mesh, validate_scale
 
 logger = get_logger(__name__)
 
+# A real combat bot is a handful of parts; a messy CAD/STL export can shatter into
+# thousands of disconnected mesh fragments (stray triangles, unwelded seams). Each
+# fragment becomes a Part -> a MuJoCo <geom> + a VTK actor + a table row, so an
+# unbounded count freezes the UI on load and explodes the MJCF the engine compiles.
+# We weld coincident vertices and cap the part count to keep every stage bounded.
+DEFAULT_MAX_PARTS = 64
+
+
+# The bundled sample bot STL is authored in centimetres; load it at this scale so
+# the demo and the self-test always treat its units correctly (it ignores the UI
+# units dropdown).
+SAMPLE_SCALE_TO_M = 0.01
+
 
 def sample_bot_path() -> str:
     """Absolute path to the bundled sample bot STL, resolved in both dev and
     frozen (.exe) runs. Shared by the entry-point self-test and the UI's
-    'Load sample bot' action so they can never drift apart."""
+    'Load sample bot' action so they can never drift apart. Load it at
+    :data:`SAMPLE_SCALE_TO_M` (the STL is in centimetres)."""
     if getattr(sys, "frozen", False):
         base = Path(sys._MEIPASS)     # PyInstaller unpack dir
     else:
         base = Path(__file__).resolve().parents[2]
-    return str(base / "data" / "sample_bots" / "wedge_bot.stl")
+    return str(base / "data" / "sample_bots" / "bot_test_1.stl")
 
 
 def _hull_or_none(mesh: trimesh.Trimesh):
@@ -153,23 +167,59 @@ class Part:
         return _mass_properties(self.mesh, self.material.density)
 
 
-def segment_mesh(mesh: trimesh.Trimesh) -> list[Part]:
-    """Split a mesh into parts by connected components of the face graph.
+def _weld(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    """Return a copy with coincident vertices fused and duplicate faces dropped.
 
-    Each disconnected solid chunk becomes one Part. Face indices into the
-    original mesh are preserved so damage can be mapped back to the source faces.
+    CAD/STL exports routinely emit a *triangle soup* whose touching triangles do
+    not share vertex indices. That breaks the face-adjacency graph, so a single
+    solid shell shatters into thousands of spurious one-triangle components.
+    Welding stitches those seams back together (validated: a 150k-face bot dropped
+    from 11,047 components to 586), which is the difference between a load that
+    freezes the app and one that finishes promptly.
     """
+    m = mesh.copy()
+    m.merge_vertices()
+    m.update_faces(m.unique_faces())
+    m.remove_unreferenced_vertices()
+    return m
+
+
+def _connected_components(mesh: trimesh.Trimesh) -> list[np.ndarray]:
+    """Face-index components of the adjacency graph, largest-first."""
     n_faces = len(mesh.faces)
     if n_faces == 0:
         return []
-
-    adjacency = mesh.face_adjacency  # (k, 2) pairs of touching faces
     components = trimesh.graph.connected_components(
-        adjacency, nodes=np.arange(n_faces)
+        mesh.face_adjacency, nodes=np.arange(n_faces)
     )
-    # Order parts largest-first for stable, intuitive numbering.
-    components = sorted(components, key=len, reverse=True)
+    return sorted(
+        (np.asarray(c, dtype=np.int64) for c in components),
+        key=len, reverse=True,
+    )
 
+
+def _cap_components(
+    components: list[np.ndarray], max_parts: int | None
+) -> list[np.ndarray]:
+    """Keep the ``max_parts - 1`` largest components and fuse the remainder into a
+    single aggregate, so a badly-fragmented mesh can never exceed ``max_parts``
+    parts. No-op when already within budget (the common, well-formed case)."""
+    if max_parts is None or len(components) <= max_parts:
+        return components
+    head = components[: max_parts - 1]
+    tail = np.concatenate(components[max_parts - 1:])
+    logger.info(
+        "capping %d mesh components to %d parts (largest %d kept, %d fragments "
+        "merged into one aggregate part)",
+        len(components), max_parts, max_parts - 1, len(components) - (max_parts - 1),
+    )
+    return [*head, tail]
+
+
+def _parts_from_components(
+    mesh: trimesh.Trimesh, components: list[np.ndarray]
+) -> list[Part]:
+    """Build one Part per face-index component, preserving original face ids."""
     parts: list[Part] = []
     for i, face_ids in enumerate(components):
         face_ids = np.asarray(face_ids, dtype=np.int64)
@@ -178,12 +228,35 @@ def segment_mesh(mesh: trimesh.Trimesh) -> list[Part]:
     return parts
 
 
+def segment_mesh(
+    mesh: trimesh.Trimesh, max_parts: int | None = DEFAULT_MAX_PARTS
+) -> list[Part]:
+    """Split a mesh into parts by connected components of the face graph.
+
+    Each disconnected solid chunk becomes one Part. Face indices into the
+    original mesh are preserved so damage can be mapped back to the source faces.
+    A mesh that fragments past ``max_parts`` has its smallest fragments fused into
+    one aggregate part (see :func:`_cap_components`); pass ``max_parts=None`` to
+    disable the cap.
+    """
+    return _parts_from_components(
+        mesh, _cap_components(_connected_components(mesh), max_parts)
+    )
+
+
 class BotModel:
     """A segmented bot: the original mesh plus its parts and aggregate properties."""
 
-    def __init__(self, original: trimesh.Trimesh, parts: list[Part]):
+    def __init__(self, original: trimesh.Trimesh, parts: list[Part],
+                 source_fragments: int | None = None):
         self.original = original
         self.parts = parts
+        # How many disconnected mesh components the source had *before* the
+        # part-count cap fused the small ones. When this exceeds ``len(parts)`` the
+        # UI tells the user the bot was simplified for simulation.
+        self.source_fragments = (
+            len(parts) if source_fragments is None else int(source_fragments)
+        )
 
     # ---- editing ---------------------------------------------------------
     def assign_material(self, part_index: int, material: Material) -> None:
@@ -285,7 +358,34 @@ def segment_scene(scene: trimesh.Scene, scale_to_m: float = 1.0):
     return original, parts
 
 
-def load_bot(path: str, scale_to_m: float = 1.0) -> BotModel:
+def _cap_named_parts(
+    original: trimesh.Trimesh, parts: list[Part], max_parts: int | None
+) -> list[Part]:
+    """Cap a named multi-body part list, keeping the largest bodies (by face count)
+    and fusing the smallest into one aggregate ``misc`` part. Preserves the CAD
+    names of the bodies that survive."""
+    if max_parts is None or len(parts) <= max_parts:
+        return parts
+    ordered = sorted(parts, key=lambda p: len(p.face_ids), reverse=True)
+    head = ordered[: max_parts - 1]
+    tail_faces = np.concatenate([p.face_ids for p in ordered[max_parts - 1:]])
+    aggregate = Part(
+        index=0,
+        mesh=original.submesh([tail_faces], append=True, repair=False),
+        face_ids=tail_faces,
+        name="misc",
+        is_brace=any(p.is_brace for p in ordered[max_parts - 1:]),
+    )
+    capped = [*head, aggregate]
+    logger.info(
+        "capping %d named bodies to %d parts (smallest %d merged into 'misc')",
+        len(parts), max_parts, len(parts) - (max_parts - 1),
+    )
+    return BotModel._reindex(capped)
+
+
+def load_bot(path: str, scale_to_m: float = 1.0,
+             max_parts: int | None = DEFAULT_MAX_PARTS) -> BotModel:
     """Load a bot mesh from `path`, scale into metres, and segment it into parts.
 
     Two input styles are supported:
@@ -296,6 +396,10 @@ def load_bot(path: str, scale_to_m: float = 1.0) -> BotModel:
     - **Single mesh** (``.stl``, or an ``.obj`` trimesh merges): split into parts
       by connected components and named ``part_0``, ``part_1`` ...
 
+    Vertices are welded (single-mesh path) and the part count is capped at
+    ``max_parts`` so a messy export that shatters into thousands of fragments still
+    loads and simulates; ``BotModel.source_fragments`` records the pre-cap count.
+
     STEP/IGES/Parasolid/JT/ACIS need a CAD kernel trimesh does not bundle; export
     3MF or glTF from the CAD tool instead.
     """
@@ -305,7 +409,10 @@ def load_bot(path: str, scale_to_m: float = 1.0) -> BotModel:
         original, parts = segment_scene(loaded, scale_to_m)
         if len(parts) >= 2:
             validate_mesh(original)
-            return BotModel(original=original, parts=parts)
+            n_fragments = len(parts)
+            return BotModel(original=original,
+                            parts=_cap_named_parts(original, parts, max_parts),
+                            source_fragments=n_fragments)
         # One body (no per-part names to keep): fall back to connected
         # components on the already-scaled mesh, matching STL behaviour.
         mesh = original
@@ -315,6 +422,8 @@ def load_bot(path: str, scale_to_m: float = 1.0) -> BotModel:
             raise ValueError(f"{path!r} did not load as a mesh or scene")
         if scale_to_m != 1.0:
             mesh.apply_scale(float(scale_to_m))
+    mesh = _weld(mesh)         # stitch triangle-soup seams before splitting
     validate_mesh(mesh)        # finite verts, non-empty, sane bounding box
-    parts = segment_mesh(mesh)
-    return BotModel(original=mesh, parts=parts)
+    components = _connected_components(mesh)
+    parts = _parts_from_components(mesh, _cap_components(components, max_parts))
+    return BotModel(original=mesh, parts=parts, source_fragments=len(components))

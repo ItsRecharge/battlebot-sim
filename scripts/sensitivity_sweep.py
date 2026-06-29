@@ -31,8 +31,12 @@ from battlebot_sim.sim.battery import StressBattery, run_battery
 from battlebot_sim.sim.engine import SimEngine
 
 DAMAGE_FIELDS = [
+    # Absolute-verdict constants (the ones that now drive the margin).
+    "weapon_tip_radius_m", "contact_vm_factor", "opponent_modulus_pa", "poisson",
+    "bending_bc_factor", "plate_flat_threshold",
+    # Heatmap-spread constants: kept to show they no longer move the verdict.
     "sigma_patch_factor", "sigma_min_frac", "sigma_part_frac",
-    "stress_sigma_frac", "kernel_radius_sigmas", "opponent_modulus_pa", "poisson",
+    "stress_sigma_frac", "kernel_radius_sigmas",
 ]
 BRACE_FIELDS = ["k_ref", "transfer", "adjacency_tol"]
 

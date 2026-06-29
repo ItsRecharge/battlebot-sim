@@ -53,6 +53,9 @@ class BatteryEvent:
     init_linvel: np.ndarray = field(default_factory=lambda: np.zeros(3))
     init_angvel: np.ndarray = field(default_factory=lambda: np.zeros(3))
     strike: Strike | None = None
+    # The seeded values realised for this trial, recorded for transparency.
+    trial_speed: float | None = None       # launch speed drawn for this event (m/s)
+    trial_tilt_deg: float | None = None     # drop tilt drawn for this event (deg)
 
 
 # Strike/containment tuning + class scaling tables live on ``BatteryConfig``
@@ -63,6 +66,14 @@ class BatteryEvent:
 # a gentle restitution rather than a dead stop.
 STRIKE_DV_CAP_FACTOR = DEFAULT_CONFIG.battery.strike_dv_cap_factor
 CONTAIN_RESTITUTION = DEFAULT_CONFIG.battery.contain_restitution
+
+# Default per-trial randomisation envelope when the caller doesn't specify one.
+# Velocity ranges from the class speed up to this multiple of it (a "large higher
+# range" the user asked for); drops are tilted by an angle drawn from this range so
+# the bot lands on a spread of faces/edges. Both are sampled from the seeded RNG, so
+# a given seed reproduces the whole battery exactly.
+DEFAULT_VELOCITY_CEILING = 2.5
+DEFAULT_DROP_TILT_RANGE_DEG = (0.0, 60.0)
 
 
 def class_speed(wc: WeightClass) -> float:
@@ -90,6 +101,20 @@ def _random_quats(rng: np.random.Generator, n: int) -> list[np.ndarray]:
     return [np.array([row[3], row[0], row[1], row[2]]) for row in q]
 
 
+def _tilt_quat(tilt_deg: float, azimuth_rad: float) -> np.ndarray:
+    """MuJoCo (w, x, y, z) quaternion that tilts the bot ``tilt_deg`` away from
+    upright about a horizontal axis pointing at ``azimuth_rad``.
+
+    A 0° tilt is a flat drop; larger tilts (toward ``azimuth``) land the bot on an
+    edge or corner. This is how a configurable *drop angle* range maps to an
+    orientation, in the same (w, x, y, z) convention as :func:`_random_quats`.
+    """
+    from scipy.spatial.transform import Rotation
+    axis = np.array([np.cos(azimuth_rad), np.sin(azimuth_rad), 0.0])
+    x, y, z, w = Rotation.from_rotvec(axis * np.radians(tilt_deg)).as_quat()
+    return np.array([w, x, y, z])
+
+
 class StressBattery:
     """Builds and holds the list of events for a class + arena.
 
@@ -101,16 +126,45 @@ class StressBattery:
     """
 
     def __init__(self, arena: Arena, weight_class: WeightClass,
-                 n_trials: int = 1, seed: int = 0):
+                 n_trials: int = 1, seed: int = 0,
+                 velocity_range: tuple[float, float] | None = None,
+                 drop_tilt_range_deg: tuple[float, float] | None = None):
         self.arena = arena
         self.weight_class = weight_class
         self.n_trials = max(1, int(n_trials))
         self.rng = np.random.default_rng(seed)
+        # Resolve the velocity envelope (m/s). ``None`` keeps the legacy single
+        # class speed (a pinned range), so the default battery is unchanged; a
+        # caller (the UI) opts into a higher/random range by passing one. A pinned
+        # range (min == max) draws no RNG, preserving the seeded draw sequence.
+        base = class_speed(weight_class)
+        if velocity_range is None:
+            velocity_range = (base, base)
+        lo, hi = float(velocity_range[0]), float(velocity_range[1])
+        self.velocity_range = (lo, hi) if lo <= hi else (hi, lo)
+        # ``None`` keeps the legacy full-random drop orientations; a range tilts
+        # drops by a seeded angle within it instead.
+        if drop_tilt_range_deg is None:
+            self.drop_tilt_range_deg = None
+        else:
+            tlo, thi = float(drop_tilt_range_deg[0]), float(drop_tilt_range_deg[1])
+            self.drop_tilt_range_deg = (tlo, thi) if tlo <= thi else (thi, tlo)
         self.events = self._build()
+
+    def _draw_speed(self) -> float:
+        """A seeded launch speed (m/s) from the configured velocity range."""
+        lo, hi = self.velocity_range
+        return float(self.rng.uniform(lo, hi)) if hi > lo else float(lo)
+
+    def _draw_drop(self) -> tuple[np.ndarray, float]:
+        """A seeded drop orientation (quat) + the tilt angle (deg) it encodes."""
+        lo, hi = self.drop_tilt_range_deg
+        tilt = float(self.rng.uniform(lo, hi)) if hi > lo else float(lo)
+        azimuth = float(self.rng.uniform(0.0, 2.0 * np.pi))
+        return _tilt_quat(tilt, azimuth), tilt
 
     def _build(self) -> list[BatteryEvent]:
         L, W, H = self.arena.interior
-        v = class_speed(self.weight_class)
         e_strike = class_strike_energy(self.weight_class)
         drop_z = max(H * 0.85, 0.2)
         n = self.n_trials
@@ -128,11 +182,21 @@ class StressBattery:
                 init_pos=np.array([0.0, 0.0, drop_z]),
                 init_quat=quat / np.linalg.norm(quat),
             ))
-        for k, quat in enumerate(_random_quats(self.rng, n)):
-            events.append(BatteryEvent(
-                name=f"drop_rand{k}", duration=1.0,
-                init_pos=np.array([0.0, 0.0, drop_z]), init_quat=quat,
-            ))
+        if self.drop_tilt_range_deg is None:
+            # Legacy default: full-random orientations (unchanged behaviour).
+            for k, quat in enumerate(_random_quats(self.rng, n)):
+                events.append(BatteryEvent(
+                    name=f"drop_rand{k}", duration=1.0,
+                    init_pos=np.array([0.0, 0.0, drop_z]), init_quat=quat,
+                ))
+        else:
+            for k in range(n):
+                quat, tilt = self._draw_drop()  # seeded tilt within the drop range
+                events.append(BatteryEvent(
+                    name=f"drop_rand{k}", duration=1.0,
+                    init_pos=np.array([0.0, 0.0, drop_z]), init_quat=quat,
+                    trial_tilt_deg=tilt,
+                ))
 
         # --- wall slams: incidence-angle sweep fired toward walls all around ---
         # Capped at 50 deg: a steeper angle puts most of the launch speed into the
@@ -143,27 +207,32 @@ class StressBattery:
             a = np.radians(ang_deg)
             az = 2.0 * np.pi * k / n_wall            # which wall to strike
             dir_h = np.array([np.cos(az), np.sin(az), 0.0])
-            vel = (np.cos(a) * dir_h + np.sin(a) * np.array([0, 0, 1.0])) * v
+            speed = self._draw_speed()              # seeded speed within the range
+            vel = (np.cos(a) * dir_h + np.sin(a) * np.array([0, 0, 1.0])) * speed
             start = np.array([-0.25 * L * np.cos(az), -0.25 * W * np.sin(az), H * 0.4])
             events.append(BatteryEvent(
                 name=f"wall_slam_{int(round(ang_deg))}deg_az{int(round(np.degrees(az)))}",
-                duration=0.9, init_pos=start, init_linvel=vel,
+                duration=0.9, init_pos=start, init_linvel=vel, trial_speed=speed,
             ))
 
-        # --- tumbles: one scripted + n seeded random spins ---
+        # --- tumbles: one scripted + n seeded random spins, each at a drawn speed ---
+        v_t = self._draw_speed()
         events.append(BatteryEvent(
             name="tumble", duration=1.8,
             init_pos=np.array([-L * 0.25, -W * 0.2, H * 0.5]),
-            init_linvel=np.array([v * 0.7, v * 0.4, 0.0]),
+            init_linvel=np.array([v_t * 0.7, v_t * 0.4, 0.0]),
             init_angvel=np.array([8.0, 12.0, 5.0]),
+            trial_speed=v_t,
         ))
         for k in range(n):
-            lin = self.rng.uniform(-1.0, 1.0, 3) * v * 0.6
+            speed = self._draw_speed()
+            lin = self.rng.uniform(-1.0, 1.0, 3) * speed * 0.6
             lin[2] = abs(lin[2]) * 0.3              # mostly horizontal launch
             events.append(BatteryEvent(
                 name=f"tumble_rand{k}", duration=1.5,
                 init_pos=np.array([0.0, 0.0, H * 0.5]),
                 init_linvel=lin, init_angvel=self.rng.uniform(-15.0, 15.0, 3),
+                trial_speed=speed,
             ))
 
         # --- opponent weapon strikes: two fixed + n seeded random directions ---

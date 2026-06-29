@@ -1,15 +1,20 @@
 # BattleBot Damage Simulator
 
+_Made by Neel Bansal._
+
 A Windows desktop app that predicts **where a combat robot will take damage** before
 you cut any metal. Load your bot's model (STL, 3MF, or glTF), assign real materials to
 its parts, pick an NHRL weight class, and the app runs your bot through an automated
 "flinging" stress battery inside a physics-simulated test cage — then shows you a replay
 and two damage heatmaps.
 
-> **Hybrid-accuracy tool.** A real rigid-body physics engine (MuJoCo) handles the
-> flinging and collisions; a simplified analytical model (Hertzian contact stress +
-> brace load-sharing) estimates damage. Results are **comparative** — great for
-> "which design survives better" — not certification-grade FEA.
+> **Engineering-grade analytic model.** A real rigid-body physics engine (MuJoCo)
+> handles the flinging and collisions; an analytic mechanics-of-materials model gives an
+> *absolute* per-part failure verdict — subsurface von-Mises contact yield (first yield
+> at p0 ≈ 1.6·yield), a combined-curvature contact that models the opponent weapon as a
+> sharp striker, and per-part beam/plate bending & membrane stress with brace
+> load-sharing. Hand-calc grade, **not** FEA — read
+> [docs/model_assumptions.md](docs/model_assumptions.md) before trusting a number.
 
 ## What it does
 

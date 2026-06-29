@@ -50,7 +50,15 @@ class SimEngine:
             logger.info("explicit-inertia MJCF compile failed; retrying with "
                         "geom-derived inertia", exc_info=True)
             xml, geom_map = build_mjcf(arena, bot, timestep, use_explicit_inertia=False)
-            return mujoco.MjModel.from_xml_string(xml), geom_map
+            try:
+                return mujoco.MjModel.from_xml_string(xml), geom_map
+            except Exception as second_exc:
+                # Both compiles failed: surface a clean error (with the geometry
+                # cause) instead of letting an opaque MuJoCo exception propagate.
+                raise RuntimeError(
+                    "MuJoCo could not compile this bot's geometry "
+                    f"({len(bot.parts)} parts): {second_exc}"
+                ) from second_exc
 
     # ---- state access ----------------------------------------------------
     def reset(self) -> None:

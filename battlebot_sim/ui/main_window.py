@@ -15,6 +15,7 @@ from battlebot_sim.errors import ValidationError
 from battlebot_sim.logging_setup import get_logger
 from battlebot_sim.materials.assign import NHRL_CLASSES, validate_weight_class
 from battlebot_sim.materials.library import load_default_library
+from battlebot_sim.mesh.brace_detect import auto_detect_braces
 from battlebot_sim.mesh.segment import load_bot
 from battlebot_sim.report.export import export_report
 from battlebot_sim.sim.battery import StressBattery, iter_battery
@@ -48,13 +49,17 @@ class StreamWorker(QtCore.QObject):
     progressed = QtCore.Signal(int, int)       # (event_index, n_events)
 
     def __init__(self, bot, arena, weight_class, library,
-                 n_trials=1, fps=60, speed=1.0):
+                 n_trials=1, fps=60, speed=1.0,
+                 velocity_range=None, drop_angle_range=None, seed=0):
         super().__init__()
         self.bot, self.arena = bot, arena
         self.weight_class, self.library = weight_class, library
         self.n_trials = n_trials
         self.fps = fps
         self._speed = max(0.05, float(speed))
+        self.velocity_range = velocity_range
+        self.drop_angle_range = drop_angle_range
+        self.seed = int(seed)
         # threading.Event: written from the UI thread (cancel), read in the worker
         # loop. Its set/is_set are atomic, so no torn reads across the boundary.
         self._cancel = threading.Event()
@@ -73,8 +78,12 @@ class StreamWorker(QtCore.QObject):
     def run(self) -> None:
         try:
             engine = SimEngine(self.arena, self.bot)
-            battery = StressBattery(self.arena, self.weight_class,
-                                    n_trials=self.n_trials)
+            battery_kw = {"n_trials": self.n_trials, "seed": self.seed}
+            if self.velocity_range is not None:
+                battery_kw["velocity_range"] = self.velocity_range
+            if self.drop_angle_range is not None:
+                battery_kw["drop_tilt_range_deg"] = self.drop_angle_range
+            battery = StressBattery(self.arena, self.weight_class, **battery_kw)
             accum = DamageAccumulator(self.bot, self.arena, self.library)
             mstream = MetricStreamer(self.bot)
             dt = engine.timestep
@@ -129,11 +138,12 @@ class StreamWorker(QtCore.QObject):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("BattleBot Damage Simulator")
+        self.setWindowTitle("BattleBot Damage Simulator — by Neel Bansal")
         self.resize(1280, 820)
 
         self.library = load_default_library()
         self.bot = None
+        self._loaded_path = None     # current model's path, for live unit re-scale
         self.arena = None
         self.trace = None
         self.result = None
@@ -177,6 +187,7 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter.setStretchFactor(2, 0)
         self.setCentralWidget(splitter)
         self.statusBar().showMessage("Load a model to begin.")
+        self.statusBar().addPermanentWidget(QtWidgets.QLabel("Made by Neel Bansal"))
 
         # --- replay timer (~60 fps to match the 60 fps capture) ---
         self._timer = QtCore.QTimer(self)
@@ -185,6 +196,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # --- signals ---
         self.setup_panel.load_requested.connect(self.load_stl)
+        self.setup_panel.units_changed.connect(self._on_units_changed)
         self.setup_panel.run_requested.connect(self.run_simulation)
         # Stop/speed are wired once here (not per-run) to a forwarder, so repeated
         # runs never stack connections onto soon-to-be-deleted workers.
@@ -208,11 +220,52 @@ class MainWindow(QtWidgets.QMainWindow):
         one guard: a failure anywhere (parse, segmentation, viewport, panels)
         surfaces a dialog and resets to a clean state, instead of silently
         leaving the Run button disabled against a half-loaded bot."""
+        # Segmenting a large mesh takes a moment; show a wait cursor so the window
+        # doesn't read as frozen while it works.
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+        self._begin_load_progress()
         try:
-            bot = load_bot(path, scale_to_m=scale_to_m)
+            bot = load_bot(path, scale_to_m=scale_to_m,
+                           max_parts=self.setup_panel.current_max_parts())
+            self._loaded_path = path
             self._install_bot(bot, path)
         except Exception as exc:
             self._fail_load(path, exc)
+        finally:
+            self._end_load_progress()
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+    # ---- load progress + live unit re-scale ------------------------------
+    def _begin_load_progress(self) -> None:
+        """Show an indeterminate 'busy' bar so a slow import never reads as a hang."""
+        p = self.setup_panel.progress
+        p.setRange(0, 0)            # 0,0 == Qt busy animation
+        p.show()
+        QtWidgets.QApplication.processEvents()
+
+    def _on_load_progress(self, i: int, n: int) -> None:
+        """Determinate progress for the per-part brace analysis."""
+        p = self.setup_panel.progress
+        p.setRange(0, max(1, n))
+        p.setValue(min(i, n))
+        QtWidgets.QApplication.processEvents()
+
+    def _end_load_progress(self) -> None:
+        p = self.setup_panel.progress
+        p.hide()
+        p.setRange(0, 1)
+        p.setValue(0)
+
+    @QtCore.Slot()
+    def _on_units_changed(self) -> None:
+        """Re-scale the loaded model when the Model-units dropdown changes.
+
+        The bundled sample bot is authored in centimetres and ignores the dropdown,
+        so it is excluded; with nothing loaded this is a no-op."""
+        from battlebot_sim.mesh.segment import sample_bot_path
+        if not self._loaded_path or self._loaded_path == sample_bot_path():
+            return
+        self.load_stl(self._loaded_path, self.setup_panel.current_scale_to_m())
 
     def _install_bot(self, bot, path: str) -> None:
         """Place a freshly loaded bot into the viewport and panels, then enable
@@ -231,14 +284,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.viewport.set_bot(self.bot)
         self.bot_view.set_bot(self.bot)         # mirror into the bot-only view
         self.parts_panel.set_bot(self.bot)
+        # Auto-flag structural braces now that parts have (default) materials; the
+        # user can still tick/untick any of them. Drives the import progress bar.
+        auto_detect_braces(self.bot, progress=self._on_load_progress)
+        self.parts_panel.refresh_braces()
         if self.setup_panel.cage_check.isChecked():
             self.viewport.show_arena(self.arena)
         else:
             self.viewport.hide_arena()
         self._update_weight_check()
         self.setup_panel.run_btn.setEnabled(True)
-        self.statusBar().showMessage(
-            f"Loaded {os.path.basename(path)} — {len(self.bot.parts)} parts.")
+        n_parts = len(self.bot.parts)
+        fragments = getattr(self.bot, "source_fragments", n_parts)
+        if fragments > n_parts:
+            msg = (f"Loaded {os.path.basename(path)} — simplified "
+                   f"{fragments} → {n_parts} parts.")
+        else:
+            msg = f"Loaded {os.path.basename(path)} — {n_parts} parts."
+        self.statusBar().showMessage(msg)
 
     def _fail_load(self, path: str, exc: Exception) -> None:
         """Report a load/setup failure and reset to a safe state so Run is never
@@ -302,6 +365,9 @@ class MainWindow(QtWidgets.QMainWindow):
         wc = NHRL_CLASSES[class_key]
         n_trials = self.setup_panel.current_trials()
         speed = self.setup_panel.current_speed()
+        velocity_range = self.setup_panel.current_velocity_range()
+        drop_angle_range = self.setup_panel.current_drop_angle_range()
+        seed = self.setup_panel.current_seed()
         try:                                    # reject bad run settings up front
             n_trials, fps = validate_run_params(n_trials, 60)
         except ValidationError as exc:
@@ -326,7 +392,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._thread = QtCore.QThread(self)
         self._worker = StreamWorker(self.bot, self.arena, wc, self.library,
-                                    n_trials, fps=fps, speed=speed)
+                                    n_trials, fps=fps, speed=speed,
+                                    velocity_range=velocity_range,
+                                    drop_angle_range=drop_angle_range, seed=seed)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.chunk.connect(self._on_chunk)
@@ -418,18 +486,31 @@ class MainWindow(QtWidgets.QMainWindow):
     def _write_summary(self) -> None:
         if self.result is None:
             return
+        ps_by_idx = {ps.part_index: ps for ps in self.result.part_stress}
         failing = self.result.parts_that_fail()
+        fracturing = [ps.part_index for ps in self.result.part_stress if ps.fractures]
         lines = []
+        if fracturing:
+            names = ", ".join(self.bot.parts[i].name for i in fracturing)
+            lines.append(f"⛔ {len(fracturing)} part(s) predicted to FRACTURE: {names}")
         if failing:
             names = ", ".join(self.bot.parts[i].name for i in failing)
             lines.append(f"⚠️ {len(failing)} part(s) predicted to yield: {names}")
-        else:
+        if not failing and not fracturing:
             lines.append("✅ No part exceeded its material yield.")
         lines.append("")
         for p in self.bot.parts:
+            ps = ps_by_idx.get(p.index)
             m = self.result.part_max_margin.get(p.index, 0.0)
-            lines.append(f"{p.name}: max margin {m:.2f}"
-                         + ("  FAIL" if m >= 1.0 else ""))
+            if ps is not None:
+                tag = ("  FRACTURE" if ps.fractures
+                       else "  FAIL" if ps.yields else "")
+                lines.append(
+                    f"{p.name}: margin {m:.2f} "
+                    f"[{ps.governing_mode}, t={ps.thickness_used * 1e3:.1f} mm]{tag}")
+            else:
+                lines.append(f"{p.name}: max margin {m:.2f}"
+                             + ("  FAIL" if m >= 1.0 else ""))
         self.results_panel.summary.setPlainText("\n".join(lines))
 
     # ---- results interactions -------------------------------------------

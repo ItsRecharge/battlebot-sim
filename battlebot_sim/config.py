@@ -67,6 +67,36 @@ class DamageConfig:
     stress_sigma_frac: float = 0.4         # stress sigma = this * energy sigma (tighter)
     kernel_radius_sigmas: float = 3.0      # gather faces within this many sigma of a hit
 
+    # --- Absolute ("industrial") failure model (see damage/structural.py) ------
+    # First yield in Hertzian contact is *subsurface* (von Mises), not at the
+    # surface: sigma_vm,max = contact_vm_factor * p0. For nu = 0.3 the coefficient
+    # is ~0.62, so first yield occurs at p0 ~= 1/0.62 ~= 1.60 * yield. A negative
+    # value means "derive it from `poisson` at runtime" via vm_factor_from_poisson.
+    contact_vm_factor: float = 0.62
+    # Effective tip radius of the opponent-weapon striker (m). A sharp striker
+    # drives a high contact pressure (p0 ~ R_eff^(-2/3)); it is combined with the
+    # struck part's local curvature via 1/R_eff = 1/R_indenter + 1/R_surface.
+    weapon_tip_radius_m: float = 4.0e-3
+    # Arena floor/wall modelled as near-flat: a large effective radius (m).
+    flat_surface_radius_m: float = 1.0
+    # Transverse-impact bending-moment factor: M = bending_bc_factor * F * span.
+    # 0.25 = simply-supported central point load (M = F L / 4); 0.125 = clamped.
+    bending_bc_factor: float = 0.25
+    # Euler-Bernoulli beam bending only applies to *slender* members. A stubby or
+    # blocky part (length/thickness below this) does not fail by global bending --
+    # it is governed by local contact/membrane stress -- so the bending term is not
+    # applied to it. This keeps absolute margins physical instead of letting a
+    # short, thick (or merged-fragment) part report an impossible beam stress.
+    bending_min_aspect: float = 8.0
+    # Sub-millimetre "parts" are almost always thin shells or mesh slivers, not
+    # solid beams; their 1/t^2 bending blows up meaninglessly. Below this
+    # thickness a part is treated as a shell (contact/membrane govern, no bending).
+    bending_min_thickness_m: float = 1.0e-3
+    # A struck face whose part is plate-like (thinnest/longest extent < this) is
+    # treated as locally flat for the contact radius (R_surface = inf) instead of
+    # an equivalent sphere, so thin armour reads its true high contact stress.
+    plate_flat_threshold: float = 0.25
+
 
 @dataclass(frozen=True)
 class BraceConfig:
@@ -75,6 +105,24 @@ class BraceConfig:
     k_ref: float = 5.0e6          # reference axial stiffness (N/m) that gives k ~ 1
     adjacency_tol: float = 5.0e-3  # parts within this many metres count as connected
     transfer: float = 0.5          # fraction of shed stress pushed into the brace
+
+
+@dataclass(frozen=True)
+class BraceDetectConfig:
+    """Thresholds for auto-flagging a part as a brace at import time.
+
+    A part is auto-flagged only when it is *all three* of: elongated (a strut,
+    not a plate or blob), stiff/strong (a real structural member), and a verified
+    load path (it bridges two or more other parts with non-trivial axial
+    stiffness). Every auto-flag stays user-overridable via the per-part checkbox.
+    """
+
+    min_aspect: float = 4.0        # longest extent / thinnest extent >= this
+    # Material gates separate structural metals/composites (Al ~69 GPa and up)
+    # from floppy plastics (<= a few GPa); the load-path k-gate does the rest.
+    min_modulus_pa: float = 60e9   # Young's modulus >= this (stiff)
+    min_yield_pa: float = 150e6    # yield strength >= this (strong)
+    min_k: float = 0.5             # normalised axial stiffness (_brace_k) >= this
 
 
 @dataclass(frozen=True)
@@ -100,13 +148,14 @@ class AppConfig:
     battery: BatteryConfig = field(default_factory=BatteryConfig)
     damage: DamageConfig = field(default_factory=DamageConfig)
     brace: BraceConfig = field(default_factory=BraceConfig)
+    brace_detect: BraceDetectConfig = field(default_factory=BraceDetectConfig)
     contact: ContactConfig = field(default_factory=ContactConfig)
 
 
 #: The default configuration. Immutable; derive copies with ``dataclasses.replace``.
 DEFAULT_CONFIG = AppConfig()
 
-_SECTIONS = ("sim", "battery", "damage", "brace", "contact")
+_SECTIONS = ("sim", "battery", "damage", "brace", "brace_detect", "contact")
 
 
 def load_config(path: str | Path, base: AppConfig = DEFAULT_CONFIG) -> AppConfig:
