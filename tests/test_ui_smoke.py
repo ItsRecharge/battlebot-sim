@@ -129,11 +129,12 @@ def test_parts_panel_selection_signal_no_echo(app):
 
 
 def test_setup_and_results_panel_wiring(app):
-    from gauntlet.ui.panels import ResultsPanel, SetupPanel
+    from gauntlet.ui.panels import ModelSetupPanel, ResultsPanel, RunControlsPanel
 
-    setup = SetupPanel()
-    assert setup.current_class_key() in {"3lb", "12lb", "30lb"}
-    assert not setup.run_btn.isEnabled()  # disabled until a bot loads
+    model = ModelSetupPanel()
+    assert model.current_class_key() in {"3lb", "12lb", "30lb"}
+    run = RunControlsPanel()
+    assert not run.run_btn.isEnabled()  # disabled until a bot loads
 
     results = ResultsPanel()
     received = []
@@ -147,62 +148,80 @@ def test_setup_and_results_panel_wiring(app):
 
 
 def test_load_sample_emits_known_good_path(app):
-    from gauntlet.mesh.segment import sample_bot_path
-    from gauntlet.ui.panels import SetupPanel
+    from gauntlet.mesh.segment import SAMPLE_SCALE_TO_M, sample_bot_path
+    from gauntlet.ui.panels import ModelSetupPanel
 
-    setup = SetupPanel()
+    model = ModelSetupPanel()
     captured = []
-    setup.load_requested.connect(lambda p, s: captured.append((p, s)))
-    # Even with a non-metre unit selected, the sample loads at scale 1.0
-    # (it is authored in metres), so the demo can never be mis-scaled.
-    setup.unit_combo.setCurrentText("millimetres")
-    setup._load_sample()
-    assert captured == [(sample_bot_path(), 1.0)]
+    model.load_requested.connect(lambda p, s: captured.append((p, s)))
+    # Even with a different unit selected, the sample loads at its fixed authored
+    # scale (it is authored in centimetres), so the demo can never be mis-scaled.
+    model.unit_combo.setCurrentText("millimetres")
+    model._load_sample()
+    assert captured == [(sample_bot_path(), SAMPLE_SCALE_TO_M)]
 
 
 def test_setup_panel_unit_scales(app):
-    from gauntlet.ui.panels import SetupPanel
+    from gauntlet.ui.panels import ModelSetupPanel
 
-    setup = SetupPanel()
-    units = [setup.unit_combo.itemText(i)
-             for i in range(setup.unit_combo.count())]
+    model = ModelSetupPanel()
+    units = [model.unit_combo.itemText(i)
+             for i in range(model.unit_combo.count())]
     # Metric units plus the imperial additions, all wired to a scale factor.
     assert units == ["millimetres", "centimetres", "metres", "inches", "feet"]
 
     expected = {"millimetres": 1e-3, "centimetres": 1e-2, "metres": 1.0,
                 "inches": 0.0254, "feet": 0.3048}
     for unit, factor in expected.items():
-        setup.unit_combo.setCurrentText(unit)
-        assert setup._scale_to_m() == factor
+        model.unit_combo.setCurrentText(unit)
+        assert model._scale_to_m() == factor
 
 
-def test_setup_panel_running_controls(app):
-    from gauntlet.ui.panels import SetupPanel
+def test_run_controls_panel_running_state(app):
+    from gauntlet.ui.panels import ModelSetupPanel, RunControlsPanel
 
-    setup = SetupPanel()
-    assert setup.stop_btn.isHidden()             # Stop hidden until a run starts
-    assert setup.current_speed() == 1.0
+    run = RunControlsPanel()
+    assert run.stop_btn.isHidden()             # Stop hidden until a run starts
+    assert run.current_speed() == 1.0
 
     speeds = []
-    setup.speed_changed.connect(speeds.append)
-    setup.speed_spin.setValue(2.5)
+    run.speed_changed.connect(speeds.append)
+    run.speed_spin.setValue(2.5)
     assert speeds and abs(speeds[-1] - 2.5) < 1e-9
-    assert setup.current_speed() == 2.5
+    assert run.current_speed() == 2.5
 
     stops = []
-    setup.stop_requested.connect(lambda: stops.append(True))
-    setup.run_btn.setEnabled(True)
-    setup.show_running(True)                      # running: Run off, Stop on, load blocked
-    assert not setup.run_btn.isEnabled()
-    assert not setup.stop_btn.isHidden()
-    assert not setup.load_btn.isEnabled()
-    setup.stop_btn.click()
+    run.stop_requested.connect(lambda: stops.append(True))
+    run.run_btn.setEnabled(True)
+    run.show_running(True)                      # running: Run off, Stop on
+    assert not run.run_btn.isEnabled()
+    assert not run.stop_btn.isHidden()
+    # Playback speed stays adjustable mid-run.
+    assert run.speed_spin.isEnabled()
+    run.stop_btn.click()
     assert stops == [True]
 
-    setup.show_running(False)                     # idle again
-    assert setup.run_btn.isEnabled()
-    assert setup.load_btn.isEnabled()
-    assert setup.stop_btn.isHidden()
+    # The model panel locks model edits in parallel during a run.
+    model = ModelSetupPanel()
+    model.set_locked(True)
+    assert not model.load_btn.isEnabled()
+    assert not model.class_combo.isEnabled()
+
+
+def test_class_change_reseeds_velocity_defaults(app):
+    from gauntlet.ui.panels import ModelSetupPanel, RunControlsPanel
+
+    model = ModelSetupPanel()
+    run = RunControlsPanel()
+    model.class_changed.connect(run.apply_class_speed_defaults)
+
+    run.apply_class_speed_defaults(model.current_class_key())
+    lo_3lb, hi_3lb = run.current_velocity_range()
+
+    # Switching to a heavier class re-seeds the velocity envelope upward.
+    model.class_combo.setCurrentIndex(model.class_combo.count() - 1)
+    lo_heavy, hi_heavy = run.current_velocity_range()
+    assert (lo_heavy, hi_heavy) != (lo_3lb, hi_3lb)
 
 
 def test_stream_worker_streams_and_finishes(app):

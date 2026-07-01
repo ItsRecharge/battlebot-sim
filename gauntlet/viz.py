@@ -233,20 +233,22 @@ def render_heatmap_png(
     base = bot_polydata(bot)
     heat, cmap, clim, title, log_scale = attach_field_smooth(base, bot, result, mode)
     plotter = pv.Plotter(off_screen=True, window_size=list(size))
-    plotter.set_background("#c7d0d9", top="#eef2f6")
-    plotter.add_mesh(heat, **heat_mesh_kwargs(mode, cmap, clim, title, log_scale))
-    if mode == "failure":
-        plotter.add_text("margin ≥ 1.0 = yields", position="upper_right",
-                         font_size=10, color="#1b2733")
-    # This is a single-renderer offscreen image, so depth-based effects are safe
-    # here (unlike the live two-layer viewport): SSAA + SSAO add realistic depth.
     try:
-        plotter.enable_anti_aliasing("ssaa")
-        plotter.enable_ssao(radius=0.05)
-    except Exception:
-        logger.debug("SSAA/SSAO unavailable for offscreen heatmap render", exc_info=True)
-    plotter.add_axes(color="#1b2733")
-    plotter.view_isometric()
-    plotter.screenshot(path)
-    plotter.close()
+        plotter.set_background("#c7d0d9", top="#eef2f6")
+        plotter.add_mesh(heat, **heat_mesh_kwargs(mode, cmap, clim, title, log_scale))
+        if mode == "failure":
+            plotter.add_text("margin >= 1.0 = yields", position="upper_right",
+                             font_size=10, color="#1b2733")
+        # This is a single-renderer offscreen image, so depth-based effects are safe
+        # here (unlike the live two-layer viewport): SSAA + SSAO add realistic depth.
+        try:
+            plotter.enable_anti_aliasing("ssaa")
+            plotter.enable_ssao(radius=0.05)
+        except Exception:
+            logger.debug("SSAA/SSAO unavailable for offscreen heatmap render", exc_info=True)
+        plotter.add_axes(color="#1b2733")
+        plotter.view_isometric()
+        plotter.screenshot(path)
+    finally:
+        plotter.close()
     return path

@@ -9,6 +9,7 @@ from gauntlet import viz
 from gauntlet.damage.model import DamageResult
 from gauntlet.materials.assign import WeightClass, validate_weight_class
 from gauntlet.mesh.segment import BotModel
+from gauntlet.report.verdict import verdict_label
 from gauntlet.sim.recorder import SimTrace
 
 
@@ -41,7 +42,7 @@ def export_report(
     lines.append("")
     lines.append(f"- **Total mass:** {total_mass:.3f} kg ({total_mass / 0.45359237:.2f} lb)")
     lines.append(f"- **Centre of mass:** ({com[0]:.3f}, {com[1]:.3f}, {com[2]:.3f}) m")
-    status = "✅ within limit" if check.ok else "❌ OVER WEIGHT"
+    status = "within limit" if check.ok else "OVER WEIGHT"
     lines.append(f"- **Weight class:** {status} — {check.message}")
     lines.append(f"- **Parts:** {len(bot.parts)}")
     lines.append("")
@@ -58,12 +59,7 @@ def export_report(
         margin = result.part_max_margin.get(p.index, 0.0)
         energy = result.part_total_energy.get(p.index, 0.0)
         ps = ps_by_idx.get(p.index)
-        if ps is not None and ps.fractures:
-            verdict = "FRACTURE ⛔"
-        elif margin >= 1.0:
-            verdict = "FAIL ⚠️"
-        else:
-            verdict = "ok"
+        verdict = verdict_label(ps, margin)
         mode = ps.governing_mode if ps is not None else "—"
         thick = f"{ps.thickness_used * 1e3:.1f}" if ps is not None else "—"
         mat = p.material.name if p.material else "—"
@@ -79,13 +75,13 @@ def export_report(
     lines.append("")
     if fracturing:
         names = ", ".join(bot.parts[i].name for i in fracturing)
-        lines.append(f"⛔ **{len(fracturing)} part(s) predicted to fracture:** {names}.")
+        lines.append(f"**{len(fracturing)} part(s) predicted to fracture:** {names}.")
     if failing:
         names = ", ".join(bot.parts[i].name for i in failing)
-        lines.append(f"⚠️ **{len(failing)} part(s) predicted to yield:** {names}.")
+        lines.append(f"**{len(failing)} part(s) predicted to yield:** {names}.")
         lines.append("Consider a stronger material, thicker section, or added bracing there.")
     if not failing and not fracturing:
-        lines.append("✅ No part exceeded its material yield in this battery.")
+        lines.append("No part exceeded its material yield in this battery.")
     lines.append("")
 
     if trace is not None:
@@ -108,11 +104,9 @@ def export_report(
     lines.append("")
     lines.append("---")
     lines.append("_Analytic absolute model: subsurface von-Mises contact yield "
-                 "(first yield at p0 ≈ 1.6·yield) + beam/plate bending & membrane "
-                 "stress + brace load-sharing. Hand-calc grade, not FEA — see "
+                 "(first yield at p0 ~ 1.6x yield) + beam/plate bending and membrane "
+                 "stress + brace load-sharing. Hand-calc grade, not FEA. See "
                  "docs/model_assumptions.md._")
-    lines.append("")
-    lines.append("_Made by Neel Bansal._")
 
     md_path = os.path.join(out_dir, "report.md")
     with open(md_path, "w", encoding="utf-8") as f:

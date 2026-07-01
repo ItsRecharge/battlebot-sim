@@ -59,6 +59,8 @@ class BotViewport(QtInteractor):
         self._face_part: np.ndarray | None = None   # cell id -> part index
         self._selection: set[int] = set()
         self._highlight_actor = None
+        self._feature_actor = None             # sharp-edge overlay on the solid bot
+        self._view_gizmo = None                # clickable lower-left orientation gizmo
         self._arena_shown = False
         # Lift applied to the bot in its static rest pose so it sits ON the floor
         # (z=0) instead of poking through it. Recomputed per bot in set_bot().
@@ -97,11 +99,13 @@ class BotViewport(QtInteractor):
             self.enable_ssao(radius=0.05)
         except Exception:
             logger.debug("SSAO unavailable on this GL stack", exc_info=True)
-        # Neutral three-point rig: warm key, cool fill, cool back/rim.
+        # Neutral three-point rig: a strong warm key carries the form, a softer cool
+        # fill keeps the shadow side legible, and a cool rim separates the bot from
+        # the backdrop. Brighter than a flat wash so the bot reads as a 3D shape.
         rig = (
-            dict(position=(6.0, -6.0, 8.0), color=(1.0, 0.97, 0.92), intensity=0.95),
-            dict(position=(-7.0, -3.0, 4.0), color=(0.90, 0.94, 1.0), intensity=0.45),
-            dict(position=(0.0, 7.0, 5.0), color=(0.96, 0.98, 1.0), intensity=0.55),
+            dict(position=(6.0, -6.0, 8.0), color=(1.0, 0.97, 0.92), intensity=1.25),
+            dict(position=(-7.0, -3.0, 4.0), color=(0.90, 0.94, 1.0), intensity=0.55),
+            dict(position=(0.0, 7.0, 5.0), color=(0.96, 0.98, 1.0), intensity=0.70),
         )
         self.renderer.RemoveAllLights()
         for spec in rig:
@@ -124,6 +128,19 @@ class BotViewport(QtInteractor):
     def _on_press(self, obj, event) -> None:
         self._press_xy = obj.GetEventPosition()
 
+    def _pick_bot(self, x, y) -> bool:
+        """Pick against the bot mesh only. Restricting the pick list to ``bot_actor``
+        makes the picker ignore the cage walls, the edge overlay and the freeplay
+        arrows that can sit in front of the bot along the ray. Returns True on a hit;
+        ``GetPickPosition``/``GetCellId`` are then valid."""
+        if self.bot_actor is None:
+            return False
+        self._picker.InitializePickList()
+        self._picker.AddPickList(self.bot_actor)
+        self._picker.PickFromListOn()
+        self._picker.Pick(x, y, 0, self.renderer)
+        return self._picker.GetActor() is self.bot_actor
+
     def _on_release(self, obj, event) -> None:
         press, self._press_xy = self._press_xy, None
         if press is None or self.bot is None or self.bot_actor is None \
@@ -134,9 +151,8 @@ class BotViewport(QtInteractor):
         x, y = obj.GetEventPosition()
         if abs(x - press[0]) > 3 or abs(y - press[1]) > 3:
             return                       # a drag (rotate/pan), not a click
-        self._picker.Pick(x, y, 0, self.renderer)
-        if self._picker.GetActor() is not self.bot_actor:
-            return                       # clicked empty space
+        if not self._pick_bot(x, y):
+            return
         idx = viz.part_at_cell(self._face_part, self._picker.GetCellId())
         if idx is None:
             return
@@ -173,9 +189,24 @@ class BotViewport(QtInteractor):
         self._selection = set()
         self._mode = "solid"
         self._show_solid()                 # colour by material from the start
-        self.add_axes(color="black")
+        self._ensure_view_gizmo()
         self.reset_camera()
         self.render()
+
+    def _ensure_view_gizmo(self) -> None:
+        """Add a clickable orientation gizmo in the lower-left corner (once): click an
+        axis handle to snap the camera to that orthographic view, with a short
+        animation. Falls back to a plain axes triad if the widget is unavailable."""
+        if self._view_gizmo is not None:
+            return
+        try:
+            widget = self.add_camera_orientation_widget()
+            widget.GetRepresentation().AnchorToLowerLeft()
+            self._view_gizmo = widget
+        except Exception:
+            logger.debug("camera orientation widget unavailable; using axes triad",
+                         exc_info=True)
+            self.add_axes(color="black")
 
     def _show_solid(self) -> None:
         """Paint the bot by each part's assigned material (neutral grey where no
@@ -183,11 +214,40 @@ class BotViewport(QtInteractor):
         highlight gives the surface a realistic machined-metal sheen."""
         self._clear_scalar_bars()              # drop any heatmap key when going solid
         self.poly.cell_data["material_rgb"] = viz.face_material_colors(self.bot)
+        # Lower ambient + higher diffuse/specular gives the surface real light-to-
+        # shadow falloff and a machined-metal highlight, so the form reads even when
+        # the bot is small inside the cage.
         self._set_bot_actor(scalars="material_rgb", rgb=True, preference="cell",
                             show_scalar_bar=False, show_edges=False,
-                            ambient=0.18, diffuse=0.85, specular=0.35,
-                            specular_power=18)
+                            ambient=0.15, diffuse=0.92, specular=0.5,
+                            specular_power=28)
         self.bot_actor.user_matrix = self._rest_matrix
+        self._show_feature_edges()
+
+    def _show_feature_edges(self) -> None:
+        """Overlay the bot's sharp and boundary edges so part outlines and creases
+        read as crisp detail instead of a flat blob. Recreated with the solid view."""
+        self._clear_feature_edges()
+        if self.poly is None:
+            return
+        try:
+            edges = self.poly.extract_feature_edges(
+                feature_angle=35, boundary_edges=True, non_manifold_edges=True,
+                feature_edges=True, manifold_edges=False)
+        except Exception:
+            logger.debug("feature-edge extraction failed", exc_info=True)
+            return
+        if edges.n_points == 0:
+            return
+        actor = self.add_mesh(edges, color="#22303a", line_width=1, lighting=False,
+                              show_scalar_bar=False, reset_camera=False)
+        actor.user_matrix = self._rest_matrix
+        self._feature_actor = actor
+
+    def _clear_feature_edges(self) -> None:
+        if self._feature_actor is not None:
+            self.remove_actor(self._feature_actor, render=False)
+            self._feature_actor = None
 
     def refresh_materials(self) -> None:
         """Re-colour after a material assignment (solid view only)."""
@@ -226,8 +286,8 @@ class BotViewport(QtInteractor):
     def show_arena(self, arena: Arena) -> None:
         for g in arena.geoms:
             box = self._box(g.center, g.half_extents)
-            opacity = 1.0 if g.role == "floor" else 0.12
-            color = "#5b6168" if g.role == "floor" else "#88a0c0"
+            opacity = 1.0 if g.role == "floor" else 0.07
+            color = "#5b6168" if g.role == "floor" else "#8fa6c4"
             self.add_mesh(box, color=color, opacity=opacity, name=f"arena_{g.name}",
                           ambient=0.2, diffuse=0.8, specular=0.1)
         self._add_floor_grid(arena)
@@ -302,9 +362,11 @@ class BotViewport(QtInteractor):
         self.bot_actor.user_matrix = m
         if self._highlight_actor is not None:
             self._highlight_actor.user_matrix = m
+        if self._feature_actor is not None:
+            self._feature_actor.user_matrix = m
         if event and event != self._last_event:
             self._last_event = event
-            self.set_event_label(f"▶  {event}")
+            self.set_event_label(event)
         self.render()
 
     def show_frame(self, i: int) -> None:
@@ -317,9 +379,11 @@ class BotViewport(QtInteractor):
         self.bot_actor.user_matrix = m
         if self._highlight_actor is not None:
             self._highlight_actor.user_matrix = m
+        if self._feature_actor is not None:
+            self._feature_actor.user_matrix = m
         if f.event != self._last_event:           # caption updates on event change
             self._last_event = f.event
-            self.set_event_label(f"▶  {f.event}")
+            self.set_event_label(f.event)
         self.render()
 
     # ---- heatmaps --------------------------------------------------------
@@ -337,6 +401,7 @@ class BotViewport(QtInteractor):
             self.set_selection(self._selection)   # keep selection visible + render
             return
         self._clear_highlight()                   # selection irrelevant on a heatmap
+        self._clear_feature_edges()               # edges belong to the solid view only
         self._clear_scalar_bars()                 # avoid stacking energy+failure bars
         self._last_event = None
         self.set_event_label("")                  # drop the stale live/replay caption

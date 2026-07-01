@@ -7,8 +7,6 @@
 
 --selftest is used to smoke-test the packaged .exe: it verifies imports, the Qt
 window, the VTK viewport, and bundled-data resolution all work, then quits.
-
-Made by Neel Bansal.
 """
 
 from __future__ import annotations

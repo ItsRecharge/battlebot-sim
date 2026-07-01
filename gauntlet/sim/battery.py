@@ -22,7 +22,6 @@ import numpy as np
 from gauntlet.arena.nhrl import Arena
 from gauntlet.config import DEFAULT_CONFIG
 from gauntlet.materials.assign import WeightClass
-from gauntlet.mesh.segment import BotModel
 from gauntlet.sim.engine import SimEngine
 from gauntlet.sim.recorder import (
     ContactEvent,
@@ -30,6 +29,7 @@ from gauntlet.sim.recorder import (
     SimTrace,
     StreamChunk,
 )
+from gauntlet.sim.strike import battery_strike_contact, quat_matrix
 
 
 @dataclass
@@ -40,6 +40,9 @@ class Strike:
     t_end: float
     direction: np.ndarray     # unit force direction (into the bot)
     energy_j: float           # kinetic energy delivered
+    # Body-frame impact point. Set by freeplay (the user's picked point); ``None``
+    # for the battery, which synthesizes an axis-aligned face point from the direction.
+    local_point: np.ndarray | None = None
 
 
 @dataclass
@@ -53,6 +56,8 @@ class BatteryEvent:
     init_linvel: np.ndarray = field(default_factory=lambda: np.zeros(3))
     init_angvel: np.ndarray = field(default_factory=lambda: np.zeros(3))
     strike: Strike | None = None
+    # Extra simultaneous strikes (freeplay fires several user-drawn impacts at once).
+    strikes: list[Strike] = field(default_factory=list)
     # The seeded values realised for this trial, recorded for transparency.
     trial_speed: float | None = None       # launch speed drawn for this event (m/s)
     trial_tilt_deg: float | None = None     # drop tilt drawn for this event (deg)
@@ -252,24 +257,6 @@ class StressBattery:
         return events
 
 
-def _quat_matrix(quat) -> np.ndarray:
-    """Body->world rotation matrix from a MuJoCo (w, x, y, z) quaternion."""
-    from scipy.spatial.transform import Rotation
-    return Rotation.from_quat([quat[1], quat[2], quat[3], quat[0]]).as_matrix()
-
-
-def _nearest_part(bot: BotModel, world_point: np.ndarray, pos, quat) -> int:
-    """Index of the part whose (transformed) centroid is closest to a point."""
-    R = _quat_matrix(quat)
-    best, best_d = 0, np.inf
-    for p in bot.parts:
-        c = R @ p.centroid + pos
-        d = np.linalg.norm(c - world_point)
-        if d < best_d:
-            best, best_d = p.index, d
-    return best
-
-
 def _contain(engine: SimEngine, lo, hi, bmin, bmax,
              restitution: float = CONTAIN_RESTITUTION) -> None:
     """Pull the bot back inside the cage if its AABB has crossed an interior wall.
@@ -356,30 +343,22 @@ def iter_battery(engine: SimEngine, battery: StressBattery, fps: int = 60):
                 engine.clear_applied()
 
                 pos, quat = engine.get_pose()
-                R = _quat_matrix(quat)            # body -> world rotation
+                R = quat_matrix(quat)            # body -> world rotation
 
-                # Scheduled opponent strike: physical impulse + synthetic contact.
-                if ev.strike and ev.strike.t_start <= t_local < ev.strike.t_end:
-                    strike = ev.strike
+                # Scheduled strikes: physical impulse + synthetic contact. The battery
+                # uses ev.strike; freeplay fires several ev.strikes at once.
+                for strike in ([ev.strike] if ev.strike is not None else []) + ev.strikes:
+                    if not (strike.t_start <= t_local < strike.t_end):
+                        continue
+                    ce, world_point, dv = battery_strike_contact(
+                        bot, strike, R, pos, quat, half, center_local, mass, dt,
+                        time=t_global + t_local, event=ev.name)
+                    # Physically launch the bot, but cap the body push so a heavy hit
+                    # doesn't fling it across the cage (the damage map still sees the
+                    # full energy through ce).
                     window = max(strike.t_end - strike.t_start, dt)
-                    dv = np.sqrt(2.0 * strike.energy_j / mass)
-                    force_mag = mass * dv / window          # reported impact severity
-                    force_phys = mass * min(dv, dv_cap) / window   # capped body push
-                    # Land on the face whose outward normal opposes the strike dir.
-                    axis = int(np.argmax(np.abs(strike.direction)))
-                    offset = np.zeros(3)
-                    offset[axis] = -np.sign(strike.direction[axis]) * half[axis]
-                    local_point = center_local + offset
-                    world_point = R @ local_point + pos
+                    force_phys = mass * min(dv, dv_cap) / window
                     engine.apply_impulse(strike.direction * force_phys, world_point)
-                    ce = ContactEvent(
-                        time=t_global + t_local, event=ev.name,
-                        pos=world_point, local_pos=local_point, normal=-strike.direction,
-                        normal_force=force_mag, tangential_force=0.0,
-                        rel_speed=dv,
-                        part_index=_nearest_part(bot, world_point, pos, quat),
-                        other="opponent_weapon",
-                    )
                     trace.contacts.append(ce)
                     pending.append(ce)
 

@@ -16,6 +16,7 @@ from gauntlet.sim.battery import (
     DEFAULT_VELOCITY_CEILING,
     class_speed,
 )
+from gauntlet.sim.strike import energy_from_force, force_from_energy
 
 
 @contextmanager
@@ -265,14 +266,13 @@ class PartsPanel(QtWidgets.QGroupBox):
             self._syncing = False
 
 
-class SetupPanel(QtWidgets.QGroupBox):
-    """Load STL, choose weight class & units, and run the battery."""
+class ModelSetupPanel(QtWidgets.QGroupBox):
+    """Load a model, choose its weight class and units, and cap segmentation. The
+    'define the bot' half of setup; running the battery lives in RunControlsPanel."""
 
     load_requested = QtCore.Signal(str, float)   # path, scale_to_m
-    run_requested = QtCore.Signal(str)            # weight class key
-    stop_requested = QtCore.Signal()              # cancel a running battery
-    speed_changed = QtCore.Signal(float)          # live playback speed multiplier
-    units_changed = QtCore.Signal()               # Model-units dropdown changed
+    units_changed = QtCore.Signal()              # Model-units dropdown changed
+    class_changed = QtCore.Signal(str)           # weight-class key changed
 
     # STL import units -> factor converting one source unit to metres. Listed in
     # the order shown in the dropdown (metric first, then imperial); millimetres
@@ -286,10 +286,11 @@ class SetupPanel(QtWidgets.QGroupBox):
     }
 
     def __init__(self, parent=None):
-        super().__init__("Setup", parent)
+        super().__init__("Model", parent)
         self.class_combo = QtWidgets.QComboBox()
         for key, wc in NHRL_CLASSES.items():
             self.class_combo.addItem(wc.name, key)
+        self.class_combo.currentIndexChanged.connect(self._emit_class_changed)
 
         self.unit_combo = QtWidgets.QComboBox()
         self.unit_combo.addItems(list(self.UNIT_SCALES_M))
@@ -300,6 +301,86 @@ class SetupPanel(QtWidgets.QGroupBox):
         self.sample_btn = QtWidgets.QPushButton("Load sample bot")
         self.sample_btn.setToolTip(
             "Load the bundled demo bot to try the full pipeline immediately.")
+
+        # Max parts: cap on segmentation so a fragmented CAD/STL still loads & runs.
+        self.maxparts_spin = QtWidgets.QSpinBox()
+        self.maxparts_spin.setRange(8, 512)
+        self.maxparts_spin.setValue(DEFAULT_MAX_PARTS)
+        self.maxparts_spin.setToolTip(
+            "Maximum number of parts a model is split into. A messy mesh that fragments "
+            "past this is simplified (smallest fragments merged) so it still loads.")
+
+        self.cage_check = QtWidgets.QCheckBox("Show arena cage during setup")
+        self.cage_check.setToolTip(
+            "Off by default so parts are easy to see and click; the cage always "
+            "appears when you run the battery.")
+        self.progress = QtWidgets.QProgressBar()
+        self.progress.setRange(0, 1)            # determinate: filled per event
+        self.progress.hide()
+
+        form = QtWidgets.QFormLayout(self)
+        form.addRow("Weight class:", self.class_combo)
+        form.addRow("Model units:", self.unit_combo)
+        form.addRow(self.load_btn)
+        form.addRow(self.sample_btn)
+        form.addRow("Max parts:", self.maxparts_spin)
+        form.addRow(self.cage_check)
+        form.addRow(self.progress)
+
+        self.load_btn.clicked.connect(self._choose_file)
+        self.sample_btn.clicked.connect(self._load_sample)
+
+    def _emit_class_changed(self, *_) -> None:
+        key = self.class_combo.currentData()
+        if key is not None:
+            self.class_changed.emit(key)
+
+    def _scale_to_m(self) -> float:
+        return self.UNIT_SCALES_M[self.unit_combo.currentText()]
+
+    def current_scale_to_m(self) -> float:
+        """The metres-per-source-unit factor for the selected Model units."""
+        return self._scale_to_m()
+
+    def current_class_key(self) -> str:
+        return self.class_combo.currentData()
+
+    def current_max_parts(self) -> int:
+        return int(self.maxparts_spin.value())
+
+    def _choose_file(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open model", "",
+            "Models (*.stl *.3mf *.gltf *.glb *.obj);;"
+            "STL (*.stl);;3MF (*.3mf);;glTF (*.gltf *.glb);;OBJ (*.obj);;"
+            "All files (*)")
+        if path:
+            self.load_requested.emit(path, self._scale_to_m())
+
+    def _load_sample(self) -> None:
+        """Load the bundled demo bot. It is authored in centimetres, so it ignores
+        the units dropdown (fixed scale) and gives an instant known-good run."""
+        from gauntlet.mesh.segment import SAMPLE_SCALE_TO_M, sample_bot_path
+        self.load_requested.emit(sample_bot_path(), SAMPLE_SCALE_TO_M)
+
+    def set_locked(self, locked: bool) -> None:
+        """Block model changes while a battery runs so the worker's bot can't change
+        underneath it."""
+        for w in (self.load_btn, self.sample_btn, self.class_combo,
+                  self.unit_combo, self.maxparts_spin):
+            w.setEnabled(not locked)
+
+
+class RunControlsPanel(QtWidgets.QGroupBox):
+    """Trial-sweep settings (speed/angle/seed), playback speed, and Run/Stop for the
+    stress battery."""
+
+    run_requested = QtCore.Signal()               # start the battery
+    stop_requested = QtCore.Signal()              # cancel a running battery
+    speed_changed = QtCore.Signal(float)          # live playback speed multiplier
+
+    def __init__(self, parent=None):
+        super().__init__("Stress battery", parent)
         self.trials_spin = QtWidgets.QSpinBox()
         self.trials_spin.setRange(1, 50)
         self.trials_spin.setValue(1)
@@ -364,17 +445,8 @@ class SetupPanel(QtWidgets.QGroupBox):
         seed_row.addWidget(self.seed_spin, 1)
         seed_row.addWidget(self.new_seed_btn)
 
-        # Max parts: cap on segmentation so a fragmented CAD/STL still loads & runs.
-        self.maxparts_spin = QtWidgets.QSpinBox()
-        self.maxparts_spin.setRange(8, 512)
-        self.maxparts_spin.setValue(DEFAULT_MAX_PARTS)
-        self.maxparts_spin.setToolTip(
-            "Maximum number of parts a model is split into. A messy mesh that fragments "
-            "past this is simplified (smallest fragments merged) so it still loads.")
-
-        # Velocity defaults follow the weight class; re-apply when the class changes.
-        self._apply_class_speed_defaults()
-        self.class_combo.currentIndexChanged.connect(self._apply_class_speed_defaults)
+        # Velocity defaults follow the weight class; MainWindow seeds them once the
+        # model panel exists and re-applies them on ModelSetupPanel.class_changed.
 
         # Live playback speed: the battery runs at (scaled) real time so the bot
         # is watchable flying around the cage. MuJoCo is much faster than real
@@ -400,63 +472,27 @@ class SetupPanel(QtWidgets.QGroupBox):
         run_row.addWidget(self.run_btn, 1)
         run_row.addWidget(self.stop_btn)
 
-        self.cage_check = QtWidgets.QCheckBox("Show arena cage during setup")
-        self.cage_check.setToolTip(
-            "Off by default so parts are easy to see and click; the cage always "
-            "appears when you run the battery.")
         self.progress = QtWidgets.QProgressBar()
         self.progress.setRange(0, 1)            # determinate: filled per event
         self.progress.hide()
 
         form = QtWidgets.QFormLayout(self)
-        form.addRow("Weight class:", self.class_combo)
-        form.addRow("Model units:", self.unit_combo)
-        form.addRow(self.load_btn)
-        form.addRow(self.sample_btn)
         form.addRow("Trials:", self.trials_spin)
         form.addRow("Impact speed:", vel_row)
         form.addRow("", self.vel_slider)
         form.addRow("Drop angle:", drop_row)
         form.addRow("Seed:", seed_row)
-        form.addRow("Max parts:", self.maxparts_spin)
         form.addRow("Playback speed:", self.speed_spin)
         form.addRow(run_row)
-        form.addRow(self.cage_check)
         form.addRow(self.progress)
 
-        self.load_btn.clicked.connect(self._choose_file)
-        self.sample_btn.clicked.connect(self._load_sample)
-        self.run_btn.clicked.connect(
-            lambda: self.run_requested.emit(self.class_combo.currentData()))
-
-    def _scale_to_m(self) -> float:
-        return self.UNIT_SCALES_M[self.unit_combo.currentText()]
-
-    def current_scale_to_m(self) -> float:
-        """The metres-per-source-unit factor for the selected Model units."""
-        return self._scale_to_m()
-
-    def _choose_file(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Open model", "",
-            "Models (*.stl *.3mf *.gltf *.glb *.obj);;"
-            "STL (*.stl);;3MF (*.3mf);;glTF (*.gltf *.glb);;OBJ (*.obj);;"
-            "All files (*)")
-        if path:
-            self.load_requested.emit(path, self._scale_to_m())
-
-    def _load_sample(self) -> None:
-        """Load the bundled demo bot. It is authored in centimetres, so it ignores
-        the units dropdown (fixed scale) and gives an instant known-good run."""
-        from gauntlet.mesh.segment import SAMPLE_SCALE_TO_M, sample_bot_path
-        self.load_requested.emit(sample_bot_path(), SAMPLE_SCALE_TO_M)
+        self.run_btn.clicked.connect(self.run_requested.emit)
 
     # ---- trial-randomisation controls -----------------------------------
-    def _apply_class_speed_defaults(self, *_) -> None:
-        """Seed the velocity range from the selected class's representative speed
+    def apply_class_speed_defaults(self, key: str) -> None:
+        """Seed the velocity range from a weight class's representative speed
         (min = class speed, max = a higher multiple of it)."""
-        key = self.class_combo.currentData()
-        if key is None:
+        if key is None or key not in NHRL_CLASSES:
             return
         base = class_speed(NHRL_CLASSES[key])
         lo = round(base, 1)
@@ -489,9 +525,6 @@ class SetupPanel(QtWidgets.QGroupBox):
     def _roll_seed(self) -> None:
         self.seed_spin.setValue(random.randrange(0, 2_147_483_647))
 
-    def current_class_key(self) -> str:
-        return self.class_combo.currentData()
-
     def current_trials(self) -> int:
         return int(self.trials_spin.value())
 
@@ -509,23 +542,17 @@ class SetupPanel(QtWidgets.QGroupBox):
     def current_seed(self) -> int:
         return int(self.seed_spin.value())
 
-    def current_max_parts(self) -> int:
-        return int(self.maxparts_spin.value())
-
     def show_running(self, running: bool) -> None:
         """Flip the panel between idle and running: while a battery runs, Run is
-        disabled and a Stop button + determinate progress bar appear; loading a
-        new model is blocked so the worker's bot can't change underneath it."""
+        disabled and a Stop button + determinate progress bar appear. The trial
+        settings lock, but playback speed stays live so the fly-around can be sped
+        up. (ModelSetupPanel.set_locked blocks model changes in parallel.)"""
         self.run_btn.setEnabled(not running)
         self.stop_btn.setVisible(running)
-        self.load_btn.setEnabled(not running)
-        self.sample_btn.setEnabled(not running)
         self.trials_spin.setEnabled(not running)
-        self.class_combo.setEnabled(not running)
-        self.unit_combo.setEnabled(not running)
         for w in (self.vel_min_spin, self.vel_max_spin, self.vel_slider,
                   self.drop_min_spin, self.drop_max_spin, self.seed_spin,
-                  self.new_seed_btn, self.maxparts_spin):
+                  self.new_seed_btn):
             w.setEnabled(not running)
         self.progress.setVisible(running)
 
@@ -580,3 +607,205 @@ class ResultsPanel(QtWidgets.QGroupBox):
     def configure_slider(self, n_frames: int) -> None:
         self.slider.setRange(0, max(0, n_frames - 1))
         self.slider.setValue(0)
+
+
+class FreeplayPanel(QtWidgets.QGroupBox):
+    """Place impact arrows on the bot, set each one's force and angle, run them, and
+    read the resulting per-part verdict."""
+
+    _ID = QtCore.Qt.ItemDataRole.UserRole
+    _ENERGY = QtCore.Qt.ItemDataRole.UserRole + 1
+    _ELEV = QtCore.Qt.ItemDataRole.UserRole + 2
+
+    arm_toggled = QtCore.Signal(bool)             # draw tool on/off
+    energy_changed = QtCore.Signal(float)         # energy (J) for the next new strike
+    strike_edited = QtCore.Signal(int, float, float)   # id, energy_j, elevation_deg
+    strike_removed = QtCore.Signal(int)           # remove the strike with this id
+    clear_requested = QtCore.Signal()             # remove all strikes
+    run_requested = QtCore.Signal()               # run the placed strikes
+    mode_changed = QtCore.Signal(str)             # "solid" | "energy" | "failure"
+
+    def __init__(self, parent=None):
+        super().__init__("Freeplay impacts", parent)
+        self._mass = 1.0           # bot mass (kg), for force <-> energy conversion
+        self._loading = False      # guard the editor while loading a selected row
+
+        self.hint = QtWidgets.QLabel(
+            "Click a point on the bot and drag to aim an incoming impact, then add a "
+            "few and Run impacts. Select a strike to change its force or angle.")
+        self.hint.setWordWrap(True)
+        self.hint.setStyleSheet("color:#57606a")
+
+        self.add_btn = QtWidgets.QPushButton("Add impact")
+        self.add_btn.setCheckable(True)
+        self.add_btn.setToolTip("Arm the draw tool, then click-drag on the bot.")
+        self.add_btn.toggled.connect(self.arm_toggled.emit)
+
+        self.force_spin = self._force_spin(
+            "Peak contact force the next strike delivers.")
+        self.force_spin.valueChanged.connect(self._on_default_force)
+
+        self.list = QtWidgets.QListWidget()
+        self.list.setToolTip("Placed impacts. Select one to edit it, Delete to remove.")
+        self.list.currentItemChanged.connect(self._on_row_changed)
+
+        self.delete_btn = QtWidgets.QPushButton("Delete selected")
+        self.delete_btn.clicked.connect(self._delete_selected)
+        self.clear_btn = QtWidgets.QPushButton("Clear all")
+        self.clear_btn.clicked.connect(self._clear_all)
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addWidget(self.delete_btn)
+        btn_row.addWidget(self.clear_btn)
+
+        # Per-strike editor: change the selected strike's force and angle after drawing.
+        self.edit_force = self._force_spin("Force of the selected strike.")
+        self.edit_angle = QtWidgets.QSpinBox()
+        self.edit_angle.setRange(-90, 90)
+        self.edit_angle.setSuffix(" °")
+        self.edit_angle.setToolTip(
+            "Angle of the selected strike below horizontal: 90 straight down, 0 level.")
+        self.edit_force.valueChanged.connect(self._on_edit)
+        self.edit_angle.valueChanged.connect(self._on_edit)
+        edit_form = QtWidgets.QFormLayout()
+        edit_form.addRow("Selected force:", self.edit_force)
+        edit_form.addRow("Selected angle:", self.edit_angle)
+        self.edit_box = QtWidgets.QGroupBox("Edit selected impact")
+        self.edit_box.setLayout(edit_form)
+
+        self.run_btn = QtWidgets.QPushButton("Run impacts")
+        self.run_btn.setEnabled(False)
+        self.run_btn.setToolTip("Add at least one impact first.")
+        self.run_btn.clicked.connect(self.run_requested.emit)
+
+        self.solid_btn = QtWidgets.QRadioButton("Solid")
+        self.energy_btn = QtWidgets.QRadioButton("Impact energy")
+        self.failure_btn = QtWidgets.QRadioButton("Failure margin")
+        self.solid_btn.setChecked(True)
+        for b, mode in ((self.solid_btn, "solid"),
+                        (self.energy_btn, "energy"),
+                        (self.failure_btn, "failure")):
+            b.toggled.connect(lambda on, m=mode: on and self.mode_changed.emit(m))
+        mode_row = QtWidgets.QHBoxLayout()
+        for b in (self.solid_btn, self.energy_btn, self.failure_btn):
+            mode_row.addWidget(b)
+
+        self.summary = QtWidgets.QTextEdit()
+        self.summary.setReadOnly(True)
+
+        # Keep the draw/run/results buttons from grabbing the focus highlight while
+        # the user is drawing a vector in the viewport.
+        for btn in (self.add_btn, self.delete_btn, self.clear_btn, self.run_btn):
+            btn.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+            btn.setAutoDefault(False)
+            btn.setDefault(False)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(self.hint)
+        form = QtWidgets.QFormLayout()
+        form.addRow(self.add_btn)
+        form.addRow("New impact force:", self.force_spin)
+        layout.addLayout(form)
+        layout.addWidget(self.list, 1)
+        layout.addLayout(btn_row)
+        layout.addWidget(self.edit_box)
+        layout.addWidget(self.run_btn)
+        layout.addLayout(mode_row)
+        layout.addWidget(self.summary, 1)
+        self._set_results_enabled(False)
+        self._on_row_changed(None, None)        # editor disabled until a row exists
+
+    @staticmethod
+    def _force_spin(tooltip: str) -> QtWidgets.QDoubleSpinBox:
+        spin = QtWidgets.QDoubleSpinBox()
+        spin.setRange(10.0, 200000.0)
+        spin.setSingleStep(100.0)
+        spin.setValue(1000.0)
+        spin.setSuffix(" N")
+        spin.setToolTip(tooltip)
+        return spin
+
+    def set_strike_scale(self, mass_kg: float) -> None:
+        """Tell the panel the bot mass so it can convert between force and energy."""
+        self._mass = max(float(mass_kg), 1e-9)
+
+    def set_suggested_energy(self, energy_j: float) -> None:
+        """Seed the new-strike force from a class-appropriate energy."""
+        force = force_from_energy(energy_j, self._mass)
+        with _blocked(self.force_spin):
+            self.force_spin.setValue(self._clamp_force(force))
+        self.energy_changed.emit(self.current_energy())
+
+    def current_energy(self) -> float:
+        return energy_from_force(self.force_spin.value(), self._mass)
+
+    def add_strike_row(self, strike) -> None:
+        force = force_from_energy(strike.energy_j, self._mass)
+        item = QtWidgets.QListWidgetItem(
+            self._row_text(strike.id, force, strike.elevation_deg))
+        item.setData(self._ID, int(strike.id))
+        item.setData(self._ENERGY, float(strike.energy_j))
+        item.setData(self._ELEV, float(strike.elevation_deg))
+        self.list.addItem(item)
+        self.run_btn.setEnabled(True)
+
+    def clear_rows(self) -> None:
+        self.list.clear()
+        self.run_btn.setEnabled(False)
+        self.summary.clear()
+        self._set_results_enabled(False)
+        self.solid_btn.setChecked(True)
+        self._on_row_changed(None, None)
+
+    def set_summary(self, text: str) -> None:
+        self.summary.setPlainText(text)
+        self._set_results_enabled(True)
+
+    # ---- internals -------------------------------------------------------
+    def _clamp_force(self, force: float) -> float:
+        return max(self.force_spin.minimum(), min(force, self.force_spin.maximum()))
+
+    def _row_text(self, sid: int, force: float, elev: float) -> str:
+        ftxt = f"{force / 1000:.1f} kN" if force >= 1000 else f"{force:.0f} N"
+        return f"#{sid + 1}: {ftxt}, {int(round(elev))}°"
+
+    def _on_default_force(self, _value: float) -> None:
+        self.energy_changed.emit(self.current_energy())
+
+    def _on_row_changed(self, current, _previous) -> None:
+        self.edit_box.setEnabled(current is not None)
+        if current is None:
+            return
+        self._loading = True
+        force = force_from_energy(current.data(self._ENERGY), self._mass)
+        with _blocked(self.edit_force, self.edit_angle):
+            self.edit_force.setValue(self._clamp_force(force))
+            self.edit_angle.setValue(int(round(current.data(self._ELEV))))
+        self._loading = False
+
+    def _on_edit(self, _value) -> None:
+        item = self.list.currentItem()
+        if self._loading or item is None:
+            return
+        sid = int(item.data(self._ID))
+        energy = energy_from_force(self.edit_force.value(), self._mass)
+        elev = float(self.edit_angle.value())
+        item.setData(self._ENERGY, energy)
+        item.setData(self._ELEV, elev)
+        item.setText(self._row_text(sid, self.edit_force.value(), elev))
+        self.strike_edited.emit(sid, energy, elev)
+
+    def _set_results_enabled(self, on: bool) -> None:
+        for w in (self.energy_btn, self.failure_btn):
+            w.setEnabled(on)
+
+    def _delete_selected(self) -> None:
+        for item in self.list.selectedItems():
+            sid = item.data(self._ID)
+            self.list.takeItem(self.list.row(item))
+            self.strike_removed.emit(int(sid))
+        if self.list.count() == 0:
+            self.run_btn.setEnabled(False)
+
+    def _clear_all(self) -> None:
+        self.clear_rows()
+        self.clear_requested.emit()

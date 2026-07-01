@@ -6,6 +6,7 @@ import os
 import threading
 import time
 
+import numpy as np
 from PySide6 import QtCore, QtWidgets
 
 from gauntlet.arena.nhrl import build_arena
@@ -18,12 +19,28 @@ from gauntlet.materials.library import load_default_library
 from gauntlet.mesh.brace_detect import auto_detect_braces
 from gauntlet.mesh.segment import load_bot
 from gauntlet.report.export import export_report
-from gauntlet.sim.battery import StressBattery, iter_battery
+from gauntlet.report.verdict import summarize_result
+from gauntlet.sim.battery import (
+    BatteryEvent,
+    StressBattery,
+    Strike,
+    class_strike_energy,
+    iter_battery,
+    run_battery,
+)
 from gauntlet.sim.engine import SimEngine
 from gauntlet.sim.recorder import SimTrace
+from gauntlet.sim.strike import FREEPLAY_STRIKE_WINDOW
 from gauntlet.ui.charts import LiveCharts, MetricStreamer
+from gauntlet.ui.freeplay_view import FreeplayViewport
 from gauntlet.ui.pacing import pace_schedule
-from gauntlet.ui.panels import PartsPanel, ResultsPanel, SetupPanel
+from gauntlet.ui.panels import (
+    FreeplayPanel,
+    ModelSetupPanel,
+    PartsPanel,
+    ResultsPanel,
+    RunControlsPanel,
+)
 from gauntlet.ui.viewport import BotOnlyView, BotViewport
 from gauntlet.validation import validate_run_params
 
@@ -131,7 +148,7 @@ class StreamWorker(QtCore.QObject):
             result = apply_brace_sharing(accum.finalize(), self.bot)
             self.finished.emit(trace, result)
         except Exception as exc:        # surface failures to the UI, don't swallow
-            logger.exception("stream worker failed")   # full traceback to the log
+            logger.exception("stream worker failed")
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
@@ -153,65 +170,129 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pending = None
 
         # --- widgets ---
-        self.viewport = BotViewport(self)
-        self.setup_panel = SetupPanel()
-        self.parts_panel = PartsPanel(self.library)
-        self.results_panel = ResultsPanel()
-        self.graphs = LiveCharts()            # live metric-vs-time strip charts
+        self.viewport = BotViewport(self)                 # in-cage fly-around (Simulate)
+        self.model_panel = ModelSetupPanel()              # load / class / units (Setup)
+        self.run_panel = RunControlsPanel()               # trial sweep + Run (Simulate)
+        self.parts_panel = PartsPanel(self.library)       # materials + braces (Setup)
+        self.results_panel = ResultsPanel()               # heatmap + replay (Simulate)
+        self.graphs = LiveCharts()                        # live metric-vs-time charts
+        self.bot_view = BotOnlyView(self)                 # final damage turntable (Simulate)
+        self.setup_preview = BotOnlyView(self)            # solid bot preview (Setup)
+        self.freeplay_view = FreeplayViewport(self)       # draw-a-strike sandbox (Freeplay)
+        self.freeplay_panel = FreeplayPanel()             # strike list + verdict (Freeplay)
 
-        # Second 3D view: just the bot, for the final damage turntable.
-        self.bot_view = BotOnlyView(self)
+        # Every viewport/panel that renders a loaded bot, fanned out by _install_bot.
+        self._bot_consumers = [self.viewport, self.bot_view, self.setup_preview,
+                               self.parts_panel, self.freeplay_view]
 
-        side = QtWidgets.QWidget()
-        side_layout = QtWidgets.QVBoxLayout(side)
-        side_layout.addWidget(self.setup_panel)
-        side_layout.addWidget(self.parts_panel)
-        side_layout.addWidget(self.results_panel)
-        side.setMaximumWidth(460)
-
-        # Control-room dashboard: the cage view + live graphs on the left, the
-        # bot-only turntable in the centre, the controls on the right — all at
-        # once so a battery run reads like a test bench.
-        left = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-        left.addWidget(self.viewport)
-        left.addWidget(self.graphs)
-        left.setStretchFactor(0, 3)
-        left.setStretchFactor(1, 1)
-
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        splitter.addWidget(left)
-        splitter.addWidget(self.bot_view)
-        splitter.addWidget(side)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setStretchFactor(2, 0)
-        self.setCentralWidget(splitter)
+        self.tabs = QtWidgets.QTabWidget()
+        self.tabs.addTab(self._build_setup_tab(), "Setup")
+        self.tabs.addTab(self._build_simulate_tab(), "Simulate")
+        self.tabs.addTab(self._build_freeplay_tab(), "Freeplay")
+        self.setCentralWidget(self.tabs)
         self.statusBar().showMessage("Load a model to begin.")
-        self.statusBar().addPermanentWidget(QtWidgets.QLabel("Made by Neel Bansal"))
 
         # --- replay timer (~60 fps to match the 60 fps capture) ---
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(16)
         self._timer.timeout.connect(self._advance_frame)
 
+        # --- freeplay bounce-replay timer ---
+        self._fp_timer = QtCore.QTimer(self)
+        self._fp_timer.setInterval(16)
+        self._fp_timer.timeout.connect(self._fp_advance)
+        self._fp_frame = 0
+
         # --- signals ---
-        self.setup_panel.load_requested.connect(self.load_stl)
-        self.setup_panel.units_changed.connect(self._on_units_changed)
-        self.setup_panel.run_requested.connect(self.run_simulation)
+        self.model_panel.load_requested.connect(self.load_stl)
+        self.model_panel.units_changed.connect(self._on_units_changed)
+        self.model_panel.class_changed.connect(self.run_panel.apply_class_speed_defaults)
+        self.model_panel.cage_check.toggled.connect(self._on_cage_toggled)
+        self.run_panel.run_requested.connect(self.run_simulation)
         # Stop/speed are wired once here (not per-run) to a forwarder, so repeated
         # runs never stack connections onto soon-to-be-deleted workers.
-        self.setup_panel.stop_requested.connect(self._on_stop_requested)
-        self.setup_panel.speed_changed.connect(self._on_speed_changed)
-        self.setup_panel.cage_check.toggled.connect(self._on_cage_toggled)
+        self.run_panel.stop_requested.connect(self._on_stop_requested)
+        self.run_panel.speed_changed.connect(self._on_speed_changed)
+        self.run_panel.apply_class_speed_defaults(self.model_panel.current_class_key())
         self.parts_panel.changed.connect(self._update_weight_check)
         self.parts_panel.changed.connect(self.viewport.refresh_materials)
         self.parts_panel.changed.connect(self.bot_view.refresh_materials)
+        self.parts_panel.changed.connect(self.setup_preview.refresh_materials)
+        self.parts_panel.changed.connect(self.freeplay_view.refresh_materials)
         self.parts_panel.selection_changed.connect(self.viewport.set_selection)
         self.viewport.part_clicked.connect(self._on_part_picked)
         self.results_panel.mode_changed.connect(self._on_mode)
         self.results_panel.frame_changed.connect(self.viewport.show_frame)
         self.results_panel.play_toggled.connect(self._on_play)
         self.results_panel.export_requested.connect(self.export)
+
+        # Freeplay: the panel arms the draw tool and lists strikes; the viewport
+        # reports each placed strike back to the list.
+        self.freeplay_panel.arm_toggled.connect(self.freeplay_view.arm_draw)
+        self.freeplay_panel.energy_changed.connect(self.freeplay_view.set_energy)
+        self.freeplay_panel.strike_edited.connect(self.freeplay_view.update_strike)
+        self.freeplay_panel.strike_removed.connect(self.freeplay_view.remove_strike)
+        self.freeplay_panel.clear_requested.connect(self.freeplay_view.clear_arrows)
+        self.freeplay_panel.run_requested.connect(self.run_freeplay)
+        self.freeplay_panel.mode_changed.connect(self.freeplay_view.show_heatmap)
+        self.freeplay_view.strike_added.connect(self.freeplay_panel.add_strike_row)
+        self.freeplay_view.set_energy(self.freeplay_panel.current_energy())
+
+    # ---- tab layouts -----------------------------------------------------
+    def _build_setup_tab(self) -> QtWidgets.QWidget:
+        """Define the bot: a solid preview on the left, load/class/units and the
+        parts-and-materials table on the right."""
+        side = QtWidgets.QWidget()
+        sl = QtWidgets.QVBoxLayout(side)
+        sl.addWidget(self.model_panel)
+        sl.addWidget(self.parts_panel, 1)
+        side.setMaximumWidth(460)
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        split.addWidget(self.setup_preview)
+        split.addWidget(side)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 0)
+        return split
+
+    def _build_simulate_tab(self) -> QtWidgets.QWidget:
+        """The control-room dashboard: the cage view + live graphs on the left, the
+        bot-only turntable in the centre, run controls + results on the right."""
+        left = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        left.addWidget(self.viewport)
+        left.addWidget(self.graphs)
+        left.setStretchFactor(0, 3)
+        left.setStretchFactor(1, 1)
+
+        side = QtWidgets.QWidget()
+        sl = QtWidgets.QVBoxLayout(side)
+        sl.addWidget(self.run_panel)
+        sl.addWidget(self.results_panel, 1)
+        side.setMaximumWidth(460)
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        split.addWidget(left)
+        split.addWidget(self.bot_view)
+        split.addWidget(side)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        split.setStretchFactor(2, 0)
+        return split
+
+    def _build_freeplay_tab(self) -> QtWidgets.QWidget:
+        """Draw-a-strike sandbox: the bot on the left, the strike list + verdict on
+        the right."""
+        side = QtWidgets.QWidget()
+        sl = QtWidgets.QVBoxLayout(side)
+        sl.addWidget(self.freeplay_panel, 1)
+        side.setMaximumWidth(460)
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        split.addWidget(self.freeplay_view)
+        split.addWidget(side)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 0)
+        return split
 
     # ---- load / setup ----------------------------------------------------
     @QtCore.Slot(str, float)
@@ -226,7 +307,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._begin_load_progress()
         try:
             bot = load_bot(path, scale_to_m=scale_to_m,
-                           max_parts=self.setup_panel.current_max_parts())
+                           max_parts=self.model_panel.current_max_parts())
             self._loaded_path = path
             self._install_bot(bot, path)
         except Exception as exc:
@@ -238,20 +319,20 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---- load progress + live unit re-scale ------------------------------
     def _begin_load_progress(self) -> None:
         """Show an indeterminate 'busy' bar so a slow import never reads as a hang."""
-        p = self.setup_panel.progress
+        p = self.model_panel.progress
         p.setRange(0, 0)            # 0,0 == Qt busy animation
         p.show()
         QtWidgets.QApplication.processEvents()
 
     def _on_load_progress(self, i: int, n: int) -> None:
         """Determinate progress for the per-part brace analysis."""
-        p = self.setup_panel.progress
+        p = self.model_panel.progress
         p.setRange(0, max(1, n))
         p.setValue(min(i, n))
         QtWidgets.QApplication.processEvents()
 
     def _end_load_progress(self) -> None:
-        p = self.setup_panel.progress
+        p = self.model_panel.progress
         p.hide()
         p.setRange(0, 1)
         p.setValue(0)
@@ -265,7 +346,7 @@ class MainWindow(QtWidgets.QMainWindow):
         from gauntlet.mesh.segment import sample_bot_path
         if not self._loaded_path or self._loaded_path == sample_bot_path():
             return
-        self.load_stl(self._loaded_path, self.setup_panel.current_scale_to_m())
+        self.load_stl(self._loaded_path, self.model_panel.current_scale_to_m())
 
     def _install_bot(self, bot, path: str) -> None:
         """Place a freshly loaded bot into the viewport and panels, then enable
@@ -275,25 +356,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self.results_panel.set_enabled(False)
         self.results_panel.solid_btn.setChecked(True)
 
-        wc = NHRL_CLASSES[self.setup_panel.current_class_key()]
+        wc = NHRL_CLASSES[self.model_panel.current_class_key()]
         self.arena = build_arena(wc)
         self.viewport.clear()
-        # Show the bot, then populate the table: the table's one-shot `changed`
-        # repaints the bot in its material colours. The arena cage stays hidden
-        # during setup (unless "show cage" is ticked) so parts are easy to click.
-        self.viewport.set_bot(self.bot)
-        self.bot_view.set_bot(self.bot)         # mirror into the bot-only view
-        self.parts_panel.set_bot(self.bot)
+        # Fan the bot out to every view/panel that renders it. The parts table's
+        # one-shot `changed` then repaints each view in material colours. The arena
+        # cage stays hidden during setup (unless "show cage" is ticked).
+        for consumer in self._bot_consumers:
+            consumer.set_bot(self.bot)
         # Auto-flag structural braces now that parts have (default) materials; the
         # user can still tick/untick any of them. Drives the import progress bar.
         auto_detect_braces(self.bot, progress=self._on_load_progress)
         self.parts_panel.refresh_braces()
-        if self.setup_panel.cage_check.isChecked():
+        if self.model_panel.cage_check.isChecked():
             self.viewport.show_arena(self.arena)
         else:
             self.viewport.hide_arena()
         self._update_weight_check()
-        self.setup_panel.run_btn.setEnabled(True)
+        self.run_panel.run_btn.setEnabled(True)
+        # Reset freeplay for the new bot: show the cage the strikes bounce it against,
+        # tell the panel the bot mass (force<->energy), and suggest a class strike.
+        self.freeplay_view.show_arena(self.arena)
+        self.freeplay_panel.clear_rows()
+        self.freeplay_panel.set_strike_scale(self.bot.total_mass())
+        self.freeplay_panel.set_suggested_energy(class_strike_energy(wc))
         n_parts = len(self.bot.parts)
         fragments = getattr(self.bot, "source_fragments", n_parts)
         if fragments > n_parts:
@@ -310,7 +396,7 @@ class MainWindow(QtWidgets.QMainWindow):
         offending mesh (degenerate parts, non-finite geometry, etc.)."""
         import traceback
         self.bot = self.arena = self.result = self.trace = None
-        self.setup_panel.run_btn.setEnabled(False)
+        self.run_panel.run_btn.setEnabled(False)
         self.results_panel.set_enabled(False)
         self.statusBar().showMessage("Load failed.")
         box = QtWidgets.QMessageBox(self)
@@ -324,7 +410,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_weight_check(self) -> None:
         if self.bot is None:
             return
-        wc = NHRL_CLASSES[self.setup_panel.current_class_key()]
+        wc = NHRL_CLASSES[self.model_panel.current_class_key()]
         check = validate_weight_class(self.bot.total_mass(), wc)
         self.parts_panel.update_weight_check(check.message, check.ok)
 
@@ -356,18 +442,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self.viewport.hide_arena()
 
     # ---- run simulation --------------------------------------------------
-    @QtCore.Slot(str)
-    def run_simulation(self, class_key: str) -> None:
+    @QtCore.Slot()
+    def run_simulation(self) -> None:
         if self.bot is None:
             return
         if self._thread is not None and self._thread.isRunning():
             return                              # already running: ignore re-clicks
-        wc = NHRL_CLASSES[class_key]
-        n_trials = self.setup_panel.current_trials()
-        speed = self.setup_panel.current_speed()
-        velocity_range = self.setup_panel.current_velocity_range()
-        drop_angle_range = self.setup_panel.current_drop_angle_range()
-        seed = self.setup_panel.current_seed()
+        wc = NHRL_CLASSES[self.model_panel.current_class_key()]
+        n_trials = self.run_panel.current_trials()
+        speed = self.run_panel.current_speed()
+        velocity_range = self.run_panel.current_velocity_range()
+        drop_angle_range = self.run_panel.current_drop_angle_range()
+        seed = self.run_panel.current_seed()
         try:                                    # reject bad run settings up front
             n_trials, fps = validate_run_params(n_trials, 60)
         except ValidationError as exc:
@@ -382,9 +468,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.graphs.reset()                     # clear the live charts for a fresh run
         self.results_panel.set_enabled(False)
         self.results_panel.solid_btn.setChecked(True)
-        self.setup_panel.show_running(True)
-        self.setup_panel.progress.setRange(0, 1)
-        self.setup_panel.progress.setValue(0)
+        self._set_running(True)
+        self.run_panel.progress.setRange(0, 1)
+        self.run_panel.progress.setValue(0)
         self._render_busy = False
         self._pending = None
         self.statusBar().showMessage(
@@ -406,7 +492,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker.failed.connect(self._thread.quit)
         self._thread.finished.connect(self._worker.deleteLater)
         self._thread.finished.connect(self._on_thread_finished)
+        self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
+
+    def _set_running(self, running: bool) -> None:
+        """Lock the run controls and the model panel together while a battery runs,
+        so neither the trial settings nor the loaded bot can change underneath the
+        worker."""
+        self.run_panel.show_running(running)
+        self.model_panel.set_locked(running)
 
     @QtCore.Slot()
     def _on_stop_requested(self) -> None:
@@ -443,8 +537,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(int, int)
     def _on_progress(self, event_index: int, n_events: int) -> None:
-        self.setup_panel.progress.setRange(0, max(1, n_events))
-        self.setup_panel.progress.setValue(min(event_index + 1, n_events))
+        self.run_panel.progress.setRange(0, max(1, n_events))
+        self.run_panel.progress.setValue(min(event_index + 1, n_events))
 
     @QtCore.Slot()
     def _on_thread_finished(self) -> None:
@@ -456,7 +550,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Cancelled before any data was collected: don't present an empty,
         # misleading "result" — just return to idle.
         if trace.total_contacts() == 0 and not trace.frames:
-            self.setup_panel.show_running(False)
+            self._set_running(False)
             self.statusBar().showMessage("Cancelled — no data collected.")
             return
         self.trace, self.result = trace, result
@@ -464,7 +558,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.viewport.set_result(result)
         self.results_panel.configure_slider(self.viewport.n_frames)
         self.results_panel.set_enabled(True)
-        self.setup_panel.show_running(False)
+        self._set_running(False)
         self._write_summary()
         self.statusBar().showMessage(
             f"Done: {trace.total_contacts()} contacts, {self.viewport.n_frames} frames.")
@@ -479,38 +573,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str)
     def _on_sim_failed(self, message: str) -> None:
-        self.setup_panel.show_running(False)
+        self._set_running(False)
         QtWidgets.QMessageBox.critical(self, "Simulation failed", message)
         self.statusBar().showMessage("Simulation failed.")
 
     def _write_summary(self) -> None:
         if self.result is None:
             return
-        ps_by_idx = {ps.part_index: ps for ps in self.result.part_stress}
-        failing = self.result.parts_that_fail()
-        fracturing = [ps.part_index for ps in self.result.part_stress if ps.fractures]
-        lines = []
-        if fracturing:
-            names = ", ".join(self.bot.parts[i].name for i in fracturing)
-            lines.append(f"⛔ {len(fracturing)} part(s) predicted to FRACTURE: {names}")
-        if failing:
-            names = ", ".join(self.bot.parts[i].name for i in failing)
-            lines.append(f"⚠️ {len(failing)} part(s) predicted to yield: {names}")
-        if not failing and not fracturing:
-            lines.append("✅ No part exceeded its material yield.")
-        lines.append("")
-        for p in self.bot.parts:
-            ps = ps_by_idx.get(p.index)
-            m = self.result.part_max_margin.get(p.index, 0.0)
-            if ps is not None:
-                tag = ("  FRACTURE" if ps.fractures
-                       else "  FAIL" if ps.yields else "")
-                lines.append(
-                    f"{p.name}: margin {m:.2f} "
-                    f"[{ps.governing_mode}, t={ps.thickness_used * 1e3:.1f} mm]{tag}")
-            else:
-                lines.append(f"{p.name}: max margin {m:.2f}"
-                             + ("  FAIL" if m >= 1.0 else ""))
+        lines = summarize_result(self.bot, self.result)
         self.results_panel.summary.setPlainText("\n".join(lines))
 
     # ---- results interactions -------------------------------------------
@@ -540,6 +610,84 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.results_panel.slider.setValue(cur + 1)
 
+    # ---- freeplay --------------------------------------------------------
+    @QtCore.Slot()
+    def run_freeplay(self) -> None:
+        """Fire the drawn strikes at the bot as real impulses inside the cage, so it
+        recoils and bounces off the walls and floor. Damage from the strikes and the
+        cage impacts is accumulated, the bounce is replayed, then the failure heatmap
+        and per-part verdict are shown."""
+        if self.bot is None or not self.freeplay_view.strikes:
+            return
+        wc = NHRL_CLASSES[self.model_panel.current_class_key()]
+        if self.arena is None:
+            self.arena = build_arena(wc)
+        rest_t = self.freeplay_view.rest_translation()
+        # Start the bot exactly where it was drawn (resting on the floor), then fire.
+        min_z = float(self.bot.original.bounds[0][2])
+        init_pos = np.array([0.0, 0.0, -min_z + 1e-3])
+        strikes = [
+            Strike(t_start=0.10, t_end=0.10 + FREEPLAY_STRIKE_WINDOW,
+                   direction=np.asarray(s.direction, dtype=float),
+                   energy_j=s.energy_j,
+                   local_point=np.asarray(s.world_point, dtype=float) - rest_t)
+            for s in self.freeplay_view.strikes
+        ]
+        event = BatteryEvent(name="freeplay", duration=2.0, init_pos=init_pos,
+                             init_quat=np.array([1.0, 0, 0, 0]), strikes=strikes)
+        battery = StressBattery(self.arena, wc, n_trials=1)
+        battery.events = [event]
+
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+        try:
+            engine = SimEngine(self.arena, self.bot)
+            trace = run_battery(engine, battery, fps=60)
+            accum = DamageAccumulator(self.bot, self.arena, self.library)
+            accum.ingest(trace.contacts, engine.timestep)
+            result = apply_brace_sharing(accum.finalize(), self.bot)
+        except Exception as exc:
+            logger.exception("freeplay run failed")
+            QtWidgets.QMessageBox.critical(
+                self, "Freeplay failed", f"{type(exc).__name__}: {exc}")
+            return
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+        self.freeplay_view.set_trace(trace)
+        self.freeplay_view.set_result(result)
+        self.freeplay_panel.set_summary("\n".join(summarize_result(self.bot, result)))
+        self.statusBar().showMessage(
+            f"Freeplay: fired {len(strikes)} strike(s), {trace.total_contacts()} contacts.")
+        self._fp_play_bounce()
+
+    def _fp_play_bounce(self) -> None:
+        """Replay the bounce once in the freeplay viewport, then settle on the
+        failure heatmap."""
+        self._fp_frame = 0
+        if self.freeplay_view.n_frames <= 1:
+            self._fp_show_result()
+            return
+        self.freeplay_view.begin_live()          # solid bot, ready to pose per frame
+        self.freeplay_view.set_arrows_visible(False)   # bot moves away from them
+        self._fp_timer.start()
+
+    def _fp_advance(self) -> None:
+        if self._fp_frame >= self.freeplay_view.n_frames - 1:
+            self._fp_timer.stop()
+            self._fp_show_result()
+            return
+        self.freeplay_view.show_frame(self._fp_frame)
+        self._fp_frame += 1
+
+    def _fp_show_result(self) -> None:
+        # Checking the radio drives show_heatmap and returns the bot to rest pose;
+        # trigger it explicitly when it is already checked from a previous run.
+        if self.freeplay_panel.failure_btn.isChecked():
+            self.freeplay_view.show_heatmap("failure")
+        else:
+            self.freeplay_panel.failure_btn.setChecked(True)
+        self.freeplay_view.set_arrows_visible(True)   # back at rest pose, arrows align
+
     # ---- export ----------------------------------------------------------
     @QtCore.Slot()
     def export(self) -> None:
@@ -548,7 +696,7 @@ class MainWindow(QtWidgets.QMainWindow):
         out_dir = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose output folder")
         if not out_dir:
             return
-        wc = NHRL_CLASSES[self.setup_panel.current_class_key()]
+        wc = NHRL_CLASSES[self.model_panel.current_class_key()]
         try:
             paths = export_report(self.bot, self.result, wc, out_dir, trace=self.trace)
         except Exception as exc:
@@ -562,6 +710,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Stop the animation timers and cleanly drain a running battery so no
         signal or timer fires into a half-destroyed window / VTK render window."""
         self._timer.stop()
+        self._fp_timer.stop()
         self.bot_view._spin.stop()
         worker, thread = self._worker, self._thread
         if worker is not None:
