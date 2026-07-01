@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gauntlet"
-version = "0.1.1"
+version = "0.2.0"
 description = "Combat Robot Stress-Test Gauntlet — impact-damage simulator for combat robots: assign materials to an STL, run an NHRL stress battery, and view damage heatmaps."
 readme = "README.md"
 license = { file = "LICENSE" }
